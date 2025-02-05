@@ -14,9 +14,9 @@ Example:
 
 """
 
-
 import torch
 import os
+import wandb
 from torch.optim.lr_scheduler import MultiStepLR
 from ppuda.config import init_config
 from ppuda.ghn.nn import GHN, ghn_parallel
@@ -27,8 +27,27 @@ from ppuda.deepnets1m.net import Network
 
 
 def main():
-
     args = init_config(mode='train_ghn')
+
+    # Initialize WandB
+    wandb.init(
+        project="ghn-training",
+        name=args.name,
+        config={
+            "dataset": args.dataset,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "weight_decay": args.wd,
+            "meta_batch_size": args.meta_batch_size,
+            "epochs": args.epochs,
+            "virtual_edges": args.virtual_edges,
+            "hypernet": args.hypernet,
+            "decoder": args.decoder,
+            "weight_norm": args.weight_norm,
+            "layernorm": args.ln,
+            "hidden_dim": args.hid
+        }
+    )
 
     train_queue, val_queue, num_classes = image_loader(args.dataset,
                                                        args.data_dir,
@@ -46,11 +65,9 @@ def main():
                                      num_nets=args.num_nets,
                                      large_images=is_imagenet)
 
-
     start_epoch = 0
     state_dict = None
     if args.ckpt is not None:
-        # Load config and GHN parameters from existing checkpoint
         state_dict = torch.load(args.ckpt, map_location=args.device)
         config = state_dict['config']
     else:
@@ -64,20 +81,17 @@ def main():
         config['layernorm'] = args.ln
         config['hid'] = args.hid
 
-
-    ghn = GHN(**config,
-              debug_level=0).to(args.device)
+    ghn = GHN(**config, debug_level=0).to(args.device)
+    wandb.run.summary['model_parameters'] = capacity(ghn)[1]
 
     if state_dict is not None:
         ghn.load_state_dict(state_dict['state_dict'])
         if args.debug:
             print('GHN with {} parameters loaded from epoch {}.'.format(capacity(ghn)[1], state_dict['epoch']))
-        start_epoch = state_dict['epoch'] + 1  # resume from the next epoch
-
+        start_epoch = state_dict['epoch'] + 1
 
     if args.multigpu:
         ghn = ghn_parallel(ghn)
-
 
     optimizer = torch.optim.Adam(ghn.parameters(), args.lr, weight_decay=args.wd)
     scheduler = MultiStepLR(optimizer, milestones=args.lr_steps, gamma=args.gamma)
@@ -86,7 +100,8 @@ def main():
         try:
             optimizer.load_state_dict(state_dict['optimzer'])
         except Exception as e:
-            print('WARNING: optimizer is not available in the checkpoint, available keys: ', state_dict.keys(), 'error:', e, '\n')
+            print('WARNING: optimizer is not available in the checkpoint, available keys: ', state_dict.keys(),
+                  'error:', e, '\n')
 
         if start_epoch > 0:
             scheduler.step(start_epoch)
@@ -100,26 +115,23 @@ def main():
                       log_interval=args.log_interval,
                       amp=args.amp)
 
-
     seen_nets = set()
-
     print('\nStarting training GHN with {} parameters!'.format(capacity(ghn)[1]))
 
     for epoch in range(start_epoch, args.epochs):
-
         print('\nepoch={:03d}/{:03d}, lr={:e}'.format(epoch + 1, args.epochs, scheduler.get_last_lr()[0]))
 
         trainer.reset()
         ghn.train()
         failed_batches = 0
+        epoch_loss = 0.0
+        epoch_steps = 0
 
         for step, (images, targets) in enumerate(train_queue):
-
             upd, loss = False, torch.zeros(1, device=args.device)
             while not upd:
                 try:
                     graphs = next(graphs_queue)
-
                     nets_torch = []
 
                     for nets_args in graphs.net_args:
@@ -130,6 +142,21 @@ def main():
                         nets_torch.append(net)
 
                     loss = trainer.update(nets_torch, images, targets, ghn=ghn, graphs=graphs)
+                    epoch_loss += loss.item()
+                    epoch_steps += 1
+
+                    # Log batch metrics
+                    wandb.log({
+                        "batch_loss": loss.item(),
+                        "batch_top1_accuracy": trainer.metrics['top1'].avg,
+                        "batch_top5_accuracy": trainer.metrics['top5'].avg,
+                        "learning_rate": scheduler.get_last_lr()[0],
+                        "epoch": epoch,
+                        "step": step,
+                        "failed_batches": failed_batches,
+                        "unique_nets_seen": len(seen_nets)
+                    })
+
                     trainer.log()
 
                     for ind in graphs.net_inds:
@@ -165,22 +192,32 @@ def main():
             if step % 10 == 0:
                 torch.cuda.empty_cache()
 
+        # Log epoch metrics
+        epoch_avg_loss = epoch_loss / epoch_steps
+        wandb.log({
+            "epoch_avg_loss": epoch_avg_loss,
+            "epoch_top1_accuracy": trainer.metrics['top1'].avg,
+            "epoch_top5_accuracy": trainer.metrics['top5'].avg,
+            "epoch": epoch,
+            "total_unique_nets": len(seen_nets)
+        })
+
         if args.save:
-            # Save config necessary to restore GHN configuration when evaluating it
             checkpoint_path = os.path.join(args.save, 'ghn.pt')
             torch.save({'state_dict': (ghn.module if args.multigpu else ghn).state_dict(),
                         'optimzer': optimizer.state_dict(),
                         'epoch': epoch,
                         'config': config}, checkpoint_path)
             print('\nsaved the checkpoint to {}'.format(checkpoint_path))
+            # Log checkpoint to WandB
+            wandb.save(checkpoint_path)
 
         print('{} unique architectures seen'.format(len(seen_nets)))
-
         scheduler.step()
 
-        # Evaluation is done in a separate script: eval_ghn.py
-
+    wandb.finish()
     print('done!')
+
 
 if __name__ == '__main__':
     main()
