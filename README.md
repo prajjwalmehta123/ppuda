@@ -4,6 +4,8 @@
 
 authors: [Boris Knyazev](http://bknyaz.github.io/), [Michal Drozdzal](https://scholar.google.es/citations?user=XK_ktwQAAAAJ&hl=en), [Graham Taylor](https://www.gwtaylor.ca/), [Adriana Romero-Soriano](https://sites.google.com/site/adriromsor/)
 
+Trying to make it task-aware
+
 
 **Updates**
 - [Jun 16, 2023] Code in this repo and in [GHN-3](http://github.com/SamsungSAILMontreal/ghn3) improved, [GHN-3 paper](https://arxiv.org/abs/2303.04143) to be presented at [ICML 2023](https://icml.cc/virtual/2023/poster/24569)
@@ -323,7 +325,6 @@ The majority of PPUDA is licensed under [MIT license](LICENSE), however portions
 
 Please submit a pull request or open a github issue (see the [details](CONTRIBUTING.md)). 
 Make sure to comply with our [code of conduct](CODE_OF_CONDUCT.md).
-
 # Acknowledgements
 
 We thank the [Vector AI](https://vectorinstitute.ai/) Engineering team (Gerald Shen, [Maria Koshkina](https://mkoshkina.github.io/) and Deval Pandya) for code review.
