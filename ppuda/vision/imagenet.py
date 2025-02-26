@@ -8,8 +8,6 @@
 ImageNet wrapper.
 
 """
-
-
 import hashlib
 from collections import defaultdict
 import torchvision

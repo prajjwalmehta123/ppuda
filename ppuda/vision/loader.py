@@ -13,6 +13,8 @@ Supports ImageNet and torchvision datasets, such as CIFAR-10 and CIFAR-100.
 
 import os
 import torch
+import numpy as np
+from typing import Tuple, List, Dict
 from torchvision.datasets import *
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
