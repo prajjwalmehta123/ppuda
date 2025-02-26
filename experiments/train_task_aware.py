@@ -287,7 +287,7 @@ def main():
                     failed_batches += 1
                 else:
                     raise
-
+        """
         # Validation phase
         print("\nRunning validation...")
         val_metrics = validate(
@@ -307,6 +307,14 @@ def main():
             epoch=epoch,
             args=args,
             metrics=val_metrics
+        )
+        """
+        save_checkpoint(
+            ghn=ta_ghn,
+            optimizer=optimizer,
+            epoch=epoch,
+            args=args,
+            metrics=None
         )
 
         # Update learning rate
