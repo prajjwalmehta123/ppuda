@@ -70,6 +70,10 @@ class TaskAwareTrainer(nn.Module):
         """
         Update model parameters using task data with improved meta-learning dynamics
         """
+        print(f"\n===== BEGINNING UPDATE =====")
+        print(f"Task shape: support={task.support_images.shape}, query={task.query_images.shape}")
+        print(f"Models count: {len(models) if isinstance(models, list) else 1}")
+
         if not isinstance(models, list):
             models = [models]
 
@@ -95,6 +99,7 @@ class TaskAwareTrainer(nn.Module):
 
             all_query_logits = []
             total_loss = 0
+            print(f"Initial total_loss: {total_loss}")
 
             for model in models:
                 # Step 1: Evaluate initial performance on support set
@@ -108,7 +113,6 @@ class TaskAwareTrainer(nn.Module):
                     initial_query_out = model(task.query_images)
                     q_out_initial = initial_query_out[0] if isinstance(initial_query_out, tuple) else initial_query_out
                     initial_query_accuracy = accuracy(q_out_initial, task.query_labels, topk=(1,))[0].item()
-
                 # Step 2: Perform inner loop adaptation if requested (simulate MAML)
                 adapted_params = None
                 if self.inner_loop_steps > 0:
@@ -155,21 +159,32 @@ class TaskAwareTrainer(nn.Module):
                 q_out = query_out[0] if isinstance(query_out, tuple) else query_out
                 query_loss = self.criterion(q_out, task.query_labels)
                 adapted_query_accuracy = accuracy(q_out, task.query_labels, topk=(1,))[0].item()
+                print(f"Model {id(model)}: support_loss={support_loss.item():.4f}, query_loss={query_loss.item():.4f}")
 
                 # Compute adaptation gain (improvement from initial to adapted)
                 adaptation_gain = adapted_query_accuracy - initial_query_accuracy
 
                 # Step 4: Compute weighted loss combining support and query objectives
                 weighted_loss = self.support_weight * support_loss + self.query_weight * query_loss
+                print(
+                    f"Weighted loss components: support_weight={self.support_weight} * {support_loss.item():.4f} + query_weight={self.query_weight} * {query_loss.item():.4f} = {weighted_loss.item():.4f}")
 
                 # Add auxiliary loss if needed
                 if self.auxiliary and isinstance(support_out, tuple) and isinstance(query_out, tuple):
-                    weighted_loss += self.auxiliary_weight * (
-                            self.support_weight * self.criterion(support_out[1], task.support_labels) +
-                            self.query_weight * self.criterion(query_out[1], task.query_labels)
+                    aux_support_loss = self.criterion(support_out[1], task.support_labels)
+                    aux_query_loss = self.criterion(query_out[1], task.query_labels)
+                    print(f"Auxiliary losses: support={aux_support_loss.item():.4f}, query={aux_query_loss.item():.4f}")
+                    aux_weighted = self.auxiliary_weight * (
+                            self.support_weight * aux_support_loss +
+                            self.query_weight * aux_query_loss
                     )
-
+                    print(f"Auxiliary weighted: {aux_weighted.item():.4f}")
+                    weighted_loss += aux_weighted
+                    print(f"Total weighted loss after auxiliary: {weighted_loss.item():.4f}")
+                print(f"Before addition: total_loss={total_loss}, adding weighted_loss={weighted_loss.item():.4f}")
                 total_loss += weighted_loss
+                print(
+                    f"After addition: new total_loss={total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss:.4f}")
                 all_query_logits.append(q_out.detach())
 
                 # Restore original parameters if we did adaptation
@@ -180,6 +195,7 @@ class TaskAwareTrainer(nn.Module):
 
         # Average loss across models
         loss = total_loss / len(models)
+        print(f"Final loss (total_loss / {len(models)}): {loss.item():.4f}")
 
         if torch.isnan(loss):
             raise RuntimeError('The loss is NaN, unable to proceed')
@@ -196,7 +212,8 @@ class TaskAwareTrainer(nn.Module):
         for group in self.optimizer.param_groups:
             parameters.extend(group['params'])
 
-        nn.utils.clip_grad_norm_(parameters, self.grad_clip)
+        grad_norm = nn.utils.clip_grad_norm_(parameters, self.grad_clip)
+        print(f"Gradient norm before clipping: {grad_norm.item():.4f}, clip threshold: {self.grad_clip}")
 
         if self.amp:
             self.scaler.step(self.optimizer)
@@ -228,7 +245,7 @@ class TaskAwareTrainer(nn.Module):
         self.metrics['adaptation_gain'].update(adaptation_gain, 1)
 
         self.step += 1
-
+        print(f"===== FINISHED UPDATE =====\n")
         return loss
 
     def log(self, step=None, epoch=None):
