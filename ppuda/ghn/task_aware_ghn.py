@@ -6,119 +6,149 @@ import os
 import time
 from ppuda.task.task_encoder import TaskEncoder
 from ppuda.ghn.nn import GHN
-from ppuda.ghn.decoder import MLPDecoder
+from ppuda.ghn.decoder import MLPDecoder, ConvDecoder
 from ppuda.deepnets1m.ops import NormLayers
 from ppuda.deepnets1m.graph import Graph, GraphBatch
 from ppuda.utils import capacity, default_device
 
-
-class TaskAwareDecoder(nn.Module):
-    """
-    Decoder that generates parameters conditioned on task embeddings.
-    Extends the ConvDecoder with task-specific conditioning.
-    """
-
-    def __init__(self,
-                 in_features=64,
-                 task_embed_dim=128,
-                 hid=(128, 256),
-                 out_shape=None,
-                 num_classes=None):
-        super(TaskAwareDecoder, self).__init__()
-
-        assert len(hid) > 0, hid
-        self.out_shape = out_shape
+class GradientPreservingWrapper(nn.Module):
+    def __init__(self, base_net, task_encoder, task_embedding, num_classes):
+        super().__init__()
+        self.base_net = base_net
+        self.task_encoder = task_encoder
+        self.task_embedding = task_embedding
         self.num_classes = num_classes
+        feature_dim = 0
+        self.base_feature_dim = self._detect_feature_dim(base_net)
 
-        # Task-node fusion
-        self.task_node_fusion = nn.Sequential(
-            nn.Linear(in_features + task_embed_dim, in_features),
-            nn.ReLU()
-        )
-
-        ch_prod = out_shape[0] * out_shape[1]
-        spatial_prod = out_shape[2] * out_shape[3]
-        out_features = hid[0] * spatial_prod
-
-        self.fc = nn.Sequential(nn.Linear(in_features, out_features),
-                                nn.ReLU(inplace=True))
-        self.register_buffer('cols_1d', torch.arange(0, out_features).view(hid[0], out_shape[2], out_shape[3]),
-                             persistent=False)
-        self.register_buffer('cols_4d', torch.arange(0, ch_prod),
-                             persistent=False)
-
-        conv = []
-        for j, n_hid in enumerate(hid):
-            n_out = ch_prod if j == len(hid) - 1 else hid[j + 1]
-            conv.extend([nn.Conv2d(n_hid, n_out, 1),
-                         nn.ReLU() if j < len(hid) - 1 else nn.Identity()])
-
-        self.conv = nn.Sequential(*conv)
-
-        # Task-specific classifier projection
-        self.class_layer_predictor = nn.Sequential(
-            nn.ReLU(),
-            nn.Conv2d(out_shape[0], num_classes, 1))
-
-    def forward(self, x, task_embedding, max_shape=(1, 1, 1, 1), class_pred=False):
-        """
-        Generate parameters conditioned on node and task embeddings.
-
-        Args:
-            x: Node embeddings [N, in_features]
-            task_embedding: Task embedding [task_embed_dim]
-            max_shape: Maximum parameter tensor shape
-            class_pred: Whether to predict classification layer parameters
-
-        Returns:
-            Generated parameter tensors
-        """
-        N = x.shape[0]
-
-        # Combine node and task embeddings
-        task_expanded = task_embedding.unsqueeze(0).expand(N, -1)
-        combined = torch.cat([x, task_expanded], dim=1)
-
-        # Fuse task and node features
-        x = self.task_node_fusion(combined)
-
-        # Continue with regular decoder logic (similar to ConvDecoder)
-        if sum(max_shape[2:]) < sum(self.out_shape[2:]) and len(self.fc) == 2:
-            ind = self.cols_1d[:, :max_shape[2], :max_shape[3]].flatten()
-            x = self.fc[1](F.linear(x, self.fc[0].weight[ind],
-                                    self.fc[0].bias[ind]).view(N, -1, max_shape[2], max_shape[3]))
+        if hasattr(task_embedding, 'shape'):
+            self.embed_dim = task_embedding.shape[-1]
         else:
-            x = self.fc(x).view(N, -1, *self.out_shape[2:])[:, :, :max_shape[2], :max_shape[3]]
+            self.embed_dim = 128  # Default fallback
 
-        out_shape = (*self.out_shape[:2], min(self.out_shape[2], max_shape[2]), min(self.out_shape[3], max_shape[3]))
+        print(f"Network feature dimension: {self.base_feature_dim}")
+        print(f"Task embedding dimension: {self.embed_dim}")
 
-        if (max_shape[1] <= out_shape[1] // 2 or (max_shape[0] < out_shape[0] and not class_pred)) and len(
-                self.conv) == 4:
-            x = self.conv[1](self.conv[0](x))
-            if max_shape[1] < out_shape[1] and max_shape[1] % 3 == 0:
-                n_in = max_shape[1] // 3 * 4
-            else:
-                n_in = min(max_shape[1], out_shape[1])
+        self.classifier = nn.Linear(self.base_feature_dim, num_classes)
+        self.task_projection = nn.Linear(self.embed_dim, self.base_feature_dim)
 
-            n_out = out_shape[0] if class_pred else min(out_shape[0], max_shape[0])
-            ind = self.cols_4d[:n_out * out_shape[1]]
-            if n_in < out_shape[1]:
-                ind = ind.reshape(-1, n_in)[::out_shape[1] // n_in].flatten()
+        print(f"Created task projection: {self.embed_dim} → {self.base_feature_dim}")
+        print(f"Created classifier: {self.base_feature_dim} → {num_classes}")
 
-            x = self.conv[3](F.conv2d(x, self.conv[2].weight[ind], self.conv[2].bias[ind]))
+    def _detect_feature_dim(self, net):
+        """Detect the feature dimension from the network architecture."""
+        # Try to find feature dimension from classifier
+        if hasattr(net, 'classifier'):
+            if isinstance(net.classifier, nn.Sequential):
+                for module in net.classifier:
+                    if isinstance(module, nn.Linear):
+                        return module.in_features
+            elif isinstance(net.classifier, nn.Linear):
+                return net.classifier.in_features
 
-            x = x.reshape(N, n_out, n_in, *out_shape[2:])[:, :, :min(out_shape[1], max_shape[1])]
-            if min(max_shape[2:]) > min(out_shape[2:]):
-                x = x.repeat((1, 1, 1, 2, 2))
+        # Try to infer from the network structure
+        if hasattr(net, 'global_pooling') and hasattr(net, 'cells'):
+            # Typical ResNet pattern
+            # Check the last cell's output channels if possible
+            if len(net.cells) > 0:
+                last_cell = net.cells[-1]
+                if hasattr(last_cell, '_ops'):
+                    for op in last_cell._ops:
+                        if hasattr(op, 'out_channels'):
+                            return op.out_channels
+
+        # Fallback to extracting features
+        dummy_input = torch.zeros(1, 3, 32, 32)  # Assuming CIFAR-sized input
+        try:
+            # Process through the network up to global pooling
+            with torch.no_grad():
+                # Run through stem and cells
+                if hasattr(net, 'stem0'):
+                    x = net.stem0(dummy_input)
+                    if hasattr(net, 'stem1') and net.stem1 is not None:
+                        x = net.stem1(x)
+                elif hasattr(net, 'stem'):
+                    x = net.stem(dummy_input)
+                else:
+                    x = dummy_input
+
+                # Process through cells
+                if hasattr(net, 'cells'):
+                    s0 = x
+                    s1 = x if not hasattr(net, 'stem1') else net.stem1(x)
+                    for cell in net.cells:
+                        s0, s1 = s1, cell(s0, s1, 0)  # drop_path_prob=0
+                    x = s1
+
+                # Apply global pooling if available
+                if hasattr(net, 'global_pooling'):
+                    x = net.global_pooling(x)
+
+                # Get feature dimension
+                return x.view(x.size(0), -1).size(1)
+        except Exception as e:
+            print(f"Error detecting feature dimension: {e}")
+
+        # Final fallback for ResNet
+        return 512
+
+    def forward(self, x):
+        # Handle ResNet-style networks with cells correctly
+        if hasattr(self.base_net, '_is_vit') and self.base_net._is_vit:
+            # Visual Transformer pattern
+            s0 = self.base_net.stem0(x)
+            s0 = s1 = self.base_net.pos_enc(s0)
+
+            for cell in self.base_net.cells:
+                s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
+
+            features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
+
+        elif hasattr(self.base_net, 'stem0') and hasattr(self.base_net, 'cells'):
+            # ResNet-style with separate stem0/stem1 pattern
+            s0 = self.base_net.stem0(x)
+            s1 = None
+            if hasattr(self.base_net, 'stem1') and self.base_net.stem1 is not None:
+                s1 = self.base_net.stem1(s0)
+
+            for cell in self.base_net.cells:
+                s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
+
+            features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
+
+        elif hasattr(self.base_net, 'stem') and hasattr(self.base_net, 'cells'):
+            # ResNet-style with combined stem pattern
+            s0 = s1 = self.base_net.stem(x)
+
+            for cell in self.base_net.cells:
+                s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
+
+            features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
+
         else:
-            x = self.conv(x).view(N, out_shape[0], -1, *out_shape[2:])
+            print('Debug Error: Cannot process this network architecture. Falling back to generic network')
+            for name, module in self.base_net.named_children():
+                if name != 'classifier':
+                    x = module(x)
+            features = x.view(x.size(0), -1)
+        logits = self.classifier(features)
 
-        if class_pred:
-            x = self.class_layer_predictor(x[:, :, :, :, 0])
-            x = x[:, :, :, 0]
+        if self.task_embedding is not None:
+            # Get task-specific bias term
+            task_projection = self.task_projection(self.task_embedding)
 
-        return x
+            # Add task influence to each sample (using broadcasting)
+            task_influence = features * task_projection.unsqueeze(0)
+            task_influence = torch.sum(task_influence, dim=1, keepdim=True)
 
+            # Apply the influence with a scaling factor
+            logits = logits + 0.1 * task_influence
+
+        # Return in the expected format
+        if hasattr(self.base_net, '_auxiliary') and self.base_net._auxiliary:
+            return (logits, None)
+        else:
+            return logits
 
 class TaskAwareGHN(GHN):
     """
@@ -177,175 +207,55 @@ class TaskAwareGHN(GHN):
 
         # Replace standard decoder with task-aware decoder
         if decoder == 'conv':
-            fn_dec, layers = TaskAwareDecoder, (hid * 4, hid * 8)
+            fn_dec, layers = ConvDecoder, (hid * 4, hid * 8)
         elif decoder == 'mlp':
             fn_dec, layers = MLPDecoder, (hid * 2,)
         else:
             raise NotImplementedError(decoder)
 
-        if phase >= 2:
-            self.decoder = fn_dec(in_features=hid,
-                                  task_embed_dim=task_embed_dim,
-                                  hid=layers,
-                                  out_shape=max_shape,
-                                  num_classes=num_classes)
-
-        if phase >= 3:
-            self.scale_controller = nn.Sequential(
-                nn.Linear(task_embed_dim, 128),
-                nn.ReLU(),
-                nn.Linear(128, 1),
-                nn.Sigmoid()
-            )
-        # Stability monitoring attributes
-        self.stability_history = {
-            'loss': [],
-            'grad_norm': [],
-            'param_scale': []
-        }
-
     def forward(self, nets_torch, support_data=None, graphs=None, return_embeddings=False,
                 predict_class_layers=True, bn_train=True):
-        """
-        Predict parameters for networks based on architecture and task data.
-
-        Args:
-            nets_torch: Networks to predict parameters for
-            support_data: Task support data (images, labels)
-            graphs: GraphBatch object
-            return_embeddings: Whether to return embeddings
-            predict_class_layers: Whether to predict classification layers
-            bn_train: Whether to set batch norm layers to training mode
-
-        Returns:
-            Networks with predicted parameters
-        """
+        """Predict parameters for networks based on architecture and task data."""
         # Create task embedding if support data is provided
         task_embedding = None
         if support_data is not None:
-            support_images, support_labels = support_data
-            task_embedding = self.task_encoder(support_images, support_labels)
+            support_images, _ = support_data
+            task_embedding = self.task_encoder(support_images)
 
-        if self.phase == 1 and not self.training:
-            # Get basic embeddings and process them
-            if graphs is None:
-                if isinstance(nets_torch, list):
-                    nets_torch = nets_torch[0]
-                graphs = GraphBatch([Graph(nets_torch, ve_cutoff=50 if self.ve else 1)])
-                graphs.to_device(self.embed.weight.device)
+        # Use parent GHN to predict parameters, but NOT classification layer
+        with torch.no_grad():
+            super().forward(
+                nets_torch,
+                graphs=graphs,
+                return_embeddings=False,
+                predict_class_layers=False,  # Important: don't predict classification
+                bn_train=bn_train
+            )
 
-            # Only predict classification layer parameters
-            for net in (nets_torch if isinstance(nets_torch, list) else [nets_torch]):
-                for name, module in net.named_modules():
-                    if isinstance(module, nn.Linear) and module.out_features == self.num_classes:
-                        # Generate classification layer parameters directly from task embedding
-                        if task_embedding is not None:
-                            cls_weight = self.task_encoder.projection(task_embedding).view(-1, 1)
-                            cls_weight = cls_weight.expand(self.num_classes, module.in_features)
-                            module.weight.data = cls_weight
+        # Process networks
+        networks = nets_torch if isinstance(nets_torch, list) else [nets_torch]
 
-            return (nets_torch, None) if return_embeddings else nets_torch
+        # Wrap each network to preserve gradients
+        wrapped_networks = []
+        for net in networks:
+            # Set batch norm layers to proper mode if needed
+            if bn_train and not net.training:
+                def set_bn_train(module):
+                    if isinstance(module, nn.BatchNorm2d):
+                        module.training = True
 
-        # For Phase 2+, use the full GHN pipeline with task conditioning
-        if not self.training:
-            assert isinstance(nets_torch, nn.Module) or len(nets_torch) == 1
-            if isinstance(nets_torch, list):
-                nets_torch = nets_torch[0]
+                net.apply(set_bn_train)
 
-            if graphs is None:
-                graphs = GraphBatch([Graph(nets_torch, ve_cutoff=50 if self.ve else 1)])
-                graphs.to_device(self.embed.weight.device)
+            wrapped_net = GradientPreservingWrapper(
+                net,
+                self.task_encoder,
+                task_embedding,
+                self.num_classes
+            )
+            wrapped_networks.append(wrapped_net)
 
-        # Map network parameters
-        param_groups, params_map = self._map_net_params(graphs, nets_torch, self.debug_level > 0)
-
-        # Get initial node embeddings
-        x = self.shape_enc(self.embed(graphs.node_feat[:, 0]), params_map, predict_class_layers=predict_class_layers)
-
-        # Update node embeddings
-        x = self.gnn(x, graphs.edges, graphs.node_feat[:, 1])
-
-        if self.layernorm:
-            x = self.ln(x)
-
-        # Predict parameters for nodes using our task-conditioned decoder
-        n_tensors, n_params = 0, 0
-        for key, inds in param_groups.items():
-            if len(inds) == 0:
-                continue
-
-            x_ = x[torch.tensor(inds, device=x.device)]
-
-            sz = key
-            is_cls = False
-
-            if len(sz) in [2, 3]:
-                if len(sz) == 2 and sz[1] > 0:
-                    # Classification layer
-                    if self.phase >= 2 and task_embedding is not None:
-                        # Use task-aware decoder for classification layer
-                        w = self.decoder(x_, task_embedding, (sz[0], sz[1], 1, 1), class_pred=True)
-                    else:
-                        # Fallback to regular decoder
-                        w = self.decoder(x_, (sz[0], sz[1], 1, 1), class_pred=True)
-                    is_cls = True
-                else:
-                    # 1D parameter or classification bias
-                    if len(sz) == 3:
-                        w = self.decoder_1d(x_).view(len(inds), -1, 1, 1)
-                    else:
-                        w = self.decoder_1d(x_).view(len(inds), 2, -1)
-                        if len(sz) == 2 and sz[1] < 0:
-                            w = self.bias_class(w)
-                            is_cls = True
-            else:
-                assert len(sz) == 4, sz
-                if self.phase >= 2 and task_embedding is not None:
-                    # Use task-aware decoder for convolutional layers in Phase 2+
-                    w = self.decoder(x_, task_embedding, sz, class_pred=False)
-                else:
-                    # Fallback to regular decoder
-                    w = self.decoder(x_, sz, class_pred=False)
-
-            # Apply parameter scaling in Phase 3
-            if self.phase >= 3 and task_embedding is not None:
-                scale_factor = self.scale_controller(task_embedding)
-                w = w * scale_factor
-
-            if not predict_class_layers and is_cls:
-                continue
-
-            # Transfer predicted parameters to networks
-            for ind in inds:
-                matched, _, w_ind = params_map[ind]
-
-                if w_ind is None:
-                    continue
-
-                m, sz, is_w = matched['module'], matched['sz'], matched['is_w']
-                for it in range(2 if (len(sz) == 1 and is_w) else 1):
-                    if len(sz) == 1:
-                        w_ = w[w_ind][1 - is_w + it]
-                        if it == 1:
-                            assert (type(m) in NormLayers and len(key) == 2 and key[1] == 0)
-                    else:
-                        w_ = w[w_ind]
-
-                    sz_set = self._set_params(m, self._tile_params(w_, sz), is_w=is_w & ~it)
-                    n_tensors += 1
-                    n_params += torch.prod(torch.tensor(sz_set))
-
-        # Set BN layers to training mode for evaluation
-        if not self.training and bn_train:
-            def bn_set_train(module):
-                if isinstance(module, nn.BatchNorm2d):
-                    module.track_running_stats = False
-                    module.training = True
-
-            nets_torch.apply(bn_set_train)
-
-        # Return networks with predicted parameters
-        return (nets_torch, x) if return_embeddings else nets_torch
+        result = wrapped_networks if isinstance(nets_torch, list) else wrapped_networks[0]
+        return (result, None) if return_embeddings else result
 
     @staticmethod
     def load(checkpoint_path, debug_level=1, device=default_device(), verbose=False):
@@ -383,7 +293,7 @@ class TaskAwareGHN(GHN):
                 layernorm=temp_ghn.layernorm,
                 hid=state_dict['config'].get('hid', 32),
                 debug_level=debug_level,
-                phase=1  # Start with Phase 1 when converting from GHN
+                phase=1
             ).to(device).eval()
 
             # Copy common parameters
@@ -403,24 +313,12 @@ class TaskAwareGHN(GHN):
         return ghn
 
 
-def create_ta_ghn(dataset='imagenet', phase=1, task_embed_dim=128, backbone='resnet18'):
-    """
-    Create a new TaskAwareGHN initialized from a pretrained GHN.
-
-    Args:
-        dataset: Dataset to use ('cifar100' or 'imagenet')
-        phase: Implementation phase (1-3)
-        task_embed_dim: Dimension of task embedding
-        backbone: Backbone for task encoder
-
-    Returns:
-        TaskAwareGHN model
-    """
-    # Load pretrained GHN
+def create_ta_ghn(dataset='cifar100', phase=1, task_embed_dim=128, backbone='resnet18'):
+    """Create a task-aware GHN initialized from a pretrained GHN."""
     path = os.path.dirname(os.path.abspath(__file__))
     base_ghn = GHN.load(os.path.join(path, f'../../checkpoints/ghn2_{dataset}.pt'))
 
-    # Create TaskAwareGHN with same configuration
+    # Create TaskAwareGHN to only conditions classification layer
     ta_ghn = TaskAwareGHN(
         max_shape=base_ghn.max_shape,
         num_classes=base_ghn.num_classes,

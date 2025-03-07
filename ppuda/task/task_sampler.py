@@ -135,6 +135,8 @@ class ClassSubset:
             targets = dataset.targets
         elif hasattr(dataset, 'labels'):
             targets = dataset.labels
+        else:
+            raise ValueError("Dataset must have targets or labels attribute")
 
         # Filter indices based on class
         self.indices = [i for i, t in enumerate(targets) if t in self.classes]
@@ -160,14 +162,3 @@ class ClassSubset:
             original_targets = self.dataset.labels
 
         return [self.class_mapping[original_targets[i]] for i in self.indices]
-
-
-if __name__ == '__main__':
-    from ppuda.vision.loader import image_loader
-
-    train_queue, val_queue, num_classes = image_loader(test=False)
-    train_sampler = TaskSampler(
-        train_queue,
-        n_way=5,
-        k_shot=1
-    )

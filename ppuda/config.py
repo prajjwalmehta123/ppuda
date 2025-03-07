@@ -62,7 +62,7 @@ def init_config(mode='eval', parser=None, verbose=True, **kwargs):
         parser = argparse.ArgumentParser(description='Parameter Prediction for Unseen Deep Architectures')
 
     # Data args
-    parser.add_argument('-d', '--dataset', type=str, default='cifar10',
+    parser.add_argument('-d', '--dataset', type=str, default='cifar100',
                         help='image dataset: cifar10/imagenet/PennFudanPed.')
     args = parser.parse_known_args()[0]
     dataset = args.dataset.lower()

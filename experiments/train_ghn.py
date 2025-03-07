@@ -167,7 +167,7 @@ def main():
 
         if args.save:
             # Save config necessary to restore GHN configuration when evaluating it
-            checkpoint_path = os.path.join(args.save, 'ghn.pt')
+            checkpoint_path = os.path.join(args.save, 'ghn2_cifar100.pt')
             torch.save({'state_dict': (ghn.module if args.multigpu else ghn).state_dict(),
                         'optimzer': optimizer.state_dict(),
                         'epoch': epoch,
