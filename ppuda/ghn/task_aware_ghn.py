@@ -26,11 +26,13 @@ class GradientPreservingWrapper(nn.Module):
         else:
             self.embed_dim = 128  # Default fallback
 
+        self.device = next(base_net.parameters()).device
+
         print(f"Network feature dimension: {self.base_feature_dim}")
         print(f"Task embedding dimension: {self.embed_dim}")
 
-        self.classifier = nn.Linear(self.base_feature_dim, num_classes)
-        self.task_projection = nn.Linear(self.embed_dim, self.base_feature_dim)
+        self.classifier = nn.Linear(self.base_feature_dim, num_classes).to(self.device)
+        self.task_projection = nn.Linear(self.embed_dim, self.base_feature_dim).to(self.device)
 
         print(f"Created task projection: {self.embed_dim} → {self.base_feature_dim}")
         print(f"Created classifier: {self.base_feature_dim} → {num_classes}")
@@ -58,7 +60,7 @@ class GradientPreservingWrapper(nn.Module):
                             return op.out_channels
 
         # Fallback to extracting features
-        dummy_input = torch.zeros(1, 3, 32, 32)  # Assuming CIFAR-sized input
+        dummy_input = torch.zeros(1, 3, 32, 32).to(next(net.parameters()).device)  # Assuming CIFAR-sized input
         try:
             # Process through the network up to global pooling
             with torch.no_grad():
@@ -93,6 +95,8 @@ class GradientPreservingWrapper(nn.Module):
         return 512
 
     def forward(self, x):
+        device = next(self.base_net.parameters()).device
+        x = x.to(device)
         # Handle ResNet-style networks with cells correctly
         if hasattr(self.base_net, '_is_vit') and self.base_net._is_vit:
             # Visual Transformer pattern
@@ -131,11 +135,13 @@ class GradientPreservingWrapper(nn.Module):
                 if name != 'classifier':
                     x = module(x)
             features = x.view(x.size(0), -1)
+        features = features.to(self.device)
         logits = self.classifier(features)
 
         if self.task_embedding is not None:
             # Get task-specific bias term
-            task_projection = self.task_projection(self.task_embedding)
+            task_embedding = self.task_embedding.to(self.device)
+            task_projection = self.task_projection(task_embedding)
 
             # Add task influence to each sample (using broadcasting)
             task_influence = features * task_projection.unsqueeze(0)
