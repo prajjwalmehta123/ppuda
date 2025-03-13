@@ -13,6 +13,8 @@ import torch.nn.functional as F
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
+import wandb
+from tqdm import tqdm
 
 from ppuda.config import init_config
 from ppuda.deepnets1m.loader import DeepNets1M
@@ -118,8 +120,29 @@ def main():
     parser.add_argument('--steps_per_epoch', type=int, default=100, help='Number of steps per epoch')
     parser.add_argument('--val_steps', type=int, default=50, help='Number of validation steps')
     parser.add_argument('--arch_batch_size', type=int, default=1, help='Number of architectures per task')
+    parser.add_argument('--wandb_project', type=str, default='ta-ghn', help='Weights & Biases project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity/username')
+    parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
+    parser.add_argument('--debug_mode', action='store_true', help='Enable debug mode with fewer steps')
 
     args = init_config(mode='train_ghn', parser=parser)
+
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            config=vars(args),
+            name=f"{args.n_way}way_{args.k_shot}shot_{args.backbone}"
+        )
+        # Log gradients and model parameters
+        wandb.watch_called = False
+
+    # Debug mode for quick testing
+    if args.debug_mode:
+        print("Debug mode enabled: using reduced training steps")
+        args.steps_per_epoch = min(5, args.steps_per_epoch)
+        args.val_steps = min(3, args.val_steps)
 
     # Set random seed
     torch.manual_seed(args.seed)
@@ -190,6 +213,11 @@ def main():
         )
         model = model.to(args.device)
 
+    # Watch model with wandb (track gradients and parameters)
+    if args.use_wandb and not wandb.watch_called:
+        wandb.watch(model, log="all", log_freq=args.log_interval)
+        wandb.watch_called = True
+
     # Create optimizer - only train task encoder parameters
     optimizer = get_optimizer(model, args.lr, args.wd)
 
@@ -230,7 +258,9 @@ def main():
         train_losses = []
         train_accs = []
 
-        for step in range(args.steps_per_epoch):
+        # Use tqdm for progress tracking
+        train_iter = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch+1} (Train)")
+        for step in train_iter:
             # Sample tasks
             tasks = train_sampler.sample_batch(args.meta_batch_size)
             tasks_data = collate_task_batch(tasks, train_dataset)
@@ -243,25 +273,17 @@ def main():
             nets_torch = []
             for nets_args in graphs.net_args:
                 net = Network(is_imagenet_input=is_imagenet, num_classes=args.n_way, light=True, **nets_args)
-                #inspect_network(net, prefix="  ")
                 nets_torch.append(net)
 
             # Forward/backward pass
             optimizer.zero_grad()
-            #print("Task encoder params require grad:", all(p.requires_grad for p in model.task_encoder.parameters()))
             batch_losses = []
             batch_accs = []
 
             for net in nets_torch:
                 support_data = (support_images.to(args.device), support_labels.to(args.device))
                 query_data = (query_images.to(args.device), query_labels.to(args.device))
-                """
-                if validate_forward_pass(model, net, support_data, query_data):
-                    print("Forward pass validation succeeded, continuing with training...")
-                else:
-                    print("Forward pass validation failed, check the errors above")
-                    exit(1)
-                """
+
                 # Task-conditioned parameter prediction
                 wrapped_net = model(
                     net,
@@ -273,7 +295,6 @@ def main():
                 query_logits = wrapped_net(query_images.to(args.device))
                 if isinstance(query_logits, tuple):
                     query_logits = query_logits[0]
-                #query_logits = query_output[0] if isinstance(query_output, tuple) else query_output
                 loss = F.cross_entropy(query_logits, query_labels.to(args.device))
 
                 # Calculate accuracy
@@ -288,16 +309,26 @@ def main():
 
             # Backward pass
             loss.backward()
-            #verify_gradient_flow(model, loss)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
             train_losses.append(loss.item())
             train_accs.append(acc)
 
-            if step % args.log_interval == 0:
-                print(f"Step {step}/{args.steps_per_epoch} - "
-                      f"Loss: {loss.item():.4f}, Accuracy: {acc:.4f}")
+            # Update tqdm progress bar
+            train_iter.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{acc:.4f}"
+            })
+
+            # Log metrics to wandb
+            if args.use_wandb and step % args.log_interval == 0:
+                wandb.log({
+                    "train/step": epoch * args.steps_per_epoch + step,
+                    "train/loss": loss.item(),
+                    "train/accuracy": acc,
+                    "train/lr": scheduler.get_last_lr()[0]
+                })
 
         # Calculate training metrics
         train_loss = np.mean(train_losses)
@@ -310,7 +341,8 @@ def main():
         val_accs = []
 
         with torch.no_grad():
-            for step in range(args.val_steps):
+            val_iter = tqdm(range(args.val_steps), desc=f"Epoch {epoch+1} (Val)")
+            for step in val_iter:
                 # Sample validation tasks
                 tasks = val_sampler.sample_batch(args.meta_batch_size)
                 tasks_data = collate_task_batch(tasks, val_dataset)
@@ -335,14 +367,14 @@ def main():
 
                 for net in nets_torch:
                     # Task-conditioned parameter prediction
-                    model(
+                    wrapped_net = model(
                         net,
                         support_data=(support_images.to(args.device), support_labels.to(args.device)),
                         graphs=graphs.to_device(args.device)
                     )
 
                     # Evaluate on query set
-                    query_output = net(query_images.to(args.device))
+                    query_output = wrapped_net(query_images.to(args.device))
                     query_logits = query_output[0] if isinstance(query_output, tuple) else query_output
                     loss = F.cross_entropy(query_logits, query_labels.to(args.device))
 
@@ -352,13 +384,32 @@ def main():
                     batch_losses.append(loss.item())
                     batch_accs.append(acc)
 
-                val_losses.append(np.mean(batch_losses))
-                val_accs.append(np.mean(batch_accs))
+                val_loss_step = np.mean(batch_losses)
+                val_acc_step = np.mean(batch_accs)
+                val_losses.append(val_loss_step)
+                val_accs.append(val_acc_step)
+
+                # Update tqdm progress bar
+                val_iter.set_postfix({
+                    'loss': f"{val_loss_step:.4f}",
+                    'acc': f"{val_acc_step:.4f}"
+                })
 
         # Calculate validation metrics
         val_loss = np.mean(val_losses)
         val_acc = np.mean(val_accs)
         print(f"Validation - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
+
+        # Log epoch metrics to wandb
+        if args.use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/epoch_loss": train_loss,
+                "train/epoch_accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_acc,
+                "learning_rate": scheduler.get_last_lr()[0]
+            })
 
         # Save checkpoint
         if args.save:
@@ -405,11 +456,20 @@ def main():
                 }, best_path)
                 print(f"Saved best model with validation accuracy {best_val_acc:.4f}")
 
+                # Log best model to wandb
+                if args.use_wandb:
+                    wandb.run.summary["best_val_accuracy"] = best_val_acc
+                    wandb.run.summary["best_epoch"] = epoch + 1
+
         # Update scheduler
         scheduler.step()
 
     print("Training completed!")
     print(f"Best validation accuracy: {best_val_acc:.4f}")
+
+    # Finish wandb run
+    if args.use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
