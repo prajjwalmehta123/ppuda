@@ -1,368 +1,523 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
+import torch
 import numpy as np
-import os
-import time
+
+from ppuda.deepnets1m.graph import GraphBatch
+from ppuda.task.architecture import ArchitectureGraphBuilder, ArchitectureEncoder, JointParameterGenerator
 from ppuda.task.task_encoder import TaskEncoder
-from ppuda.ghn.nn import GHN
-from ppuda.ghn.decoder import MLPDecoder, ConvDecoder
-from ppuda.deepnets1m.ops import NormLayers
-from ppuda.deepnets1m.graph import Graph, GraphBatch
-from ppuda.utils import capacity, default_device
 
-class GradientPreservingWrapper(nn.Module):
-    def __init__(self, base_net, task_encoder, task_embedding, num_classes):
-        super().__init__()
-        self.base_net = base_net
-        self.task_encoder = task_encoder
-        self.task_embedding = task_embedding
-        self.num_classes = num_classes
-        feature_dim = 0
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.base_feature_dim = self._detect_feature_dim(base_net)
 
-        if hasattr(task_embedding, 'shape'):
-            self.embed_dim = task_embedding.shape[-1]
-        else:
-            self.embed_dim = 128  # Default fallback
-
-        #print(f"Network feature dimension: {self.base_feature_dim}")
-        #print(f"Task embedding dimension: {self.embed_dim}")
-
-        self.classifier = nn.Linear(self.base_feature_dim, num_classes).to(self.device)
-        self.task_projection = nn.Linear(self.embed_dim, self.base_feature_dim).to(self.device)
-
-        #print(f"Created task projection: {self.embed_dim} → {self.base_feature_dim}")
-        #print(f"Created classifier: {self.base_feature_dim} → {num_classes}")
-
-    def _detect_feature_dim(self, net):
-        """Detect the feature dimension from the network architecture."""
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # Try to find feature dimension from classifier
-        if hasattr(net, 'classifier'):
-            if isinstance(net.classifier, nn.Sequential):
-                for module in net.classifier:
-                    if isinstance(module, nn.Linear):
-                        return module.in_features
-            elif isinstance(net.classifier, nn.Linear):
-                return net.classifier.in_features
-
-        # Try to infer from the network structure
-        if hasattr(net, 'global_pooling') and hasattr(net, 'cells'):
-            # Typical ResNet pattern
-            # Check the last cell's output channels if possible
-            if len(net.cells) > 0:
-                last_cell = net.cells[-1]
-                if hasattr(last_cell, '_ops'):
-                    for op in last_cell._ops:
-                        if hasattr(op, 'out_channels'):
-                            return op.out_channels
-
-        try:
-            # Process through the network up to global pooling
-            dummy_input = torch.zeros(1, 3, 32, 32).to(self.device)  # Assuming CIFAR-sized input
-            with torch.no_grad():
-                # Run through stem and cells
-                if hasattr(net, 'stem0'):
-                    x = net.stem0(dummy_input)
-                    if hasattr(net, 'stem1') and net.stem1 is not None:
-                        x = net.stem1(x)
-                elif hasattr(net, 'stem'):
-                    x = net.stem(dummy_input)
-                else:
-                    x = dummy_input
-
-                # Process through cells
-                if hasattr(net, 'cells'):
-                    s0 = x
-                    s1 = x if not hasattr(net, 'stem1') else net.stem1(x)
-                    for cell in net.cells:
-                        s0, s1 = s1, cell(s0, s1, 0)  # drop_path_prob=0
-                    x = s1
-
-                # Apply global pooling if available
-                if hasattr(net, 'global_pooling'):
-                    x = net.global_pooling(x)
-
-                # Get feature dimension
-                return x.view(x.size(0), -1).size(1)
-        except Exception as e:
-            print(f"Debug Error: Cannot process this network architecture. Falling back to default feature dim")
-        # Final fallback for ResNet
-        return 512
-
-    def forward(self, x):
-        x = x.to(self.device)
-        is_lightweight = hasattr(self.base_net, 'stem0') and isinstance(getattr(self.base_net.stem0, 'weight', None),
-                                                                       tuple)
-        if is_lightweight:
-            # If lightweight network, skip base_net processing and use features directly
-            features = x.view(x.size(0), -1)  # Flatten the input as features
-            if features.size(1) != self.base_feature_dim:
-                # Adapt feature dimension if needed
-                features = F.adaptive_avg_pool1d(features.unsqueeze(1), self.base_feature_dim).squeeze(1)
-        else:
-            # Handle ResNet-style networks with cells correctly
-            try:
-                if hasattr(self.base_net, '_is_vit') and self.base_net._is_vit:
-                    # Visual Transformer pattern
-                    s0 = self.base_net.stem0(x)
-                    s0 = s1 = self.base_net.pos_enc(s0)
-
-                    for cell in self.base_net.cells:
-                        s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
-
-                    features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
-
-                elif hasattr(self.base_net, 'stem0') and hasattr(self.base_net, 'cells'):
-                    # ResNet-style with separate stem0/stem1 pattern
-                    s0 = self.base_net.stem0(x)
-                    s1 = None
-                    if hasattr(self.base_net, 'stem1') and self.base_net.stem1 is not None:
-                        s1 = self.base_net.stem1(s0)
-
-                    for cell in self.base_net.cells:
-                        s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
-
-                    features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
-
-                elif hasattr(self.base_net, 'stem') and hasattr(self.base_net, 'cells'):
-                    # ResNet-style with combined stem pattern
-                    s0 = s1 = self.base_net.stem(x)
-
-                    for cell in self.base_net.cells:
-                        s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
-
-                    features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
-
-                else:
-                    print('Debug Error: Cannot process this network architecture. Falling back to generic network')
-                    for name, module in self.base_net.named_children():
-                        if name != 'classifier':
-                            x = module(x)
-                    features = x.view(x.size(0), -1)
-            except Exception as e:
-                print(f"Forward pass error: {e}. Using feature extraction fallback.")
-                features = x.view(x.size(0), -1)
-                if features.size(1) != self.base_feature_dim:
-                    features = F.adaptive_avg_pool1d(features.unsqueeze(1), self.base_feature_dim).squeeze(1)
-        features = features.to(self.device)
-        logits = self.classifier(features)
-
-        if self.task_embedding is not None:
-            # Get task-specific bias term
-            task_embedding = self.task_embedding.to(self.device)
-            task_projection = self.task_projection(task_embedding)
-
-            # Add task influence to each sample (using broadcasting)
-            task_influence = features * task_projection.unsqueeze(0)
-            task_influence = torch.sum(task_influence, dim=1, keepdim=True)
-
-            # Apply the influence with a scaling factor
-            logits = logits + 0.1 * task_influence
-
-        # Return in the expected format
-        if hasattr(self.base_net, '_auxiliary') and self.base_net._auxiliary:
-            return (logits, None)
-        else:
-            return logits
-
-class TaskAwareGHN(GHN):
+class ArchitectureAwareGHN(nn.Module):
     """
-    Task-Aware Graph HyperNetwork that predicts parameters conditioned on both
-    architecture and task data.
+    Architecture-aware hybrid GHN for few-shot learning.
+    Uses both architecture and task information to predict parameters.
     """
 
     def __init__(self,
-                 max_shape,
-                 num_classes,
+                 feature_dim=512,
+                 arch_embed_dim=128,
                  task_embed_dim=128,
-                 backbone='resnet18',
-                 hypernet='gatedgnn',
-                 decoder='conv',
-                 weight_norm=False,
-                 ve=False,
-                 layernorm=False,
-                 hid=32,
-                 debug_level=0,
-                 phase=1):
+                 hidden_dim=256,
+                 num_classes=5,
+                 device='cpu',
+                 ve_cutoff=50):
         """
-        Initialize TaskAwareGHN.
-
         Args:
-            max_shape: Maximum parameter shape [C_out, C_in, H, W]
-            num_classes: Number of classes for the target dataset
-            task_embed_dim: Dimension of task embedding
-            backbone: Backbone model for the task encoder
-            hypernet: Type of hypernetwork ('gatedgnn' or 'mlp')
-            decoder: Type of decoder ('conv' or 'mlp')
-            weight_norm: Whether to normalize weights
-            ve: Whether to use virtual edges
-            layernorm: Whether to use layer normalization
-            hid: Hidden dimension
-            debug_level: Level of debug information
-            phase: Implementation phase (1-3)
+            feature_dim: Dimension of backbone features
+            arch_embed_dim: Dimension of architecture embeddings
+            task_embed_dim: Dimension of task embeddings
+            hidden_dim: Dimension of hidden layers
+            num_classes: Number of classes (N-way)
+            device: Device to use
+            ve_cutoff: Maximum shortest path length for virtual edges
         """
-        # Initialize parent GHN class
-        super(TaskAwareGHN, self).__init__(
-            max_shape=max_shape,
-            num_classes=num_classes,
-            hypernet=hypernet,
-            decoder=decoder,
-            weight_norm=weight_norm,
-            ve=ve,
-            layernorm=layernorm,
-            hid=hid,
-            debug_level=debug_level
-        )
-
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.arch_embed_dim = arch_embed_dim
         self.task_embed_dim = task_embed_dim
-        self.phase = phase
+        self.hidden_dim = hidden_dim
+        self.num_classes = num_classes
+        self.device = device
+        self.ve_cutoff = ve_cutoff
+
+        # Feature extractor (frozen ResNet backbone)
+        self.backbone = models.resnet18(pretrained=True)
+        self.backbone.fc = nn.Identity()  # Remove classification layer
+        self.backbone = self.backbone.to(device)
+
+        # Freeze backbone parameters
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Architecture graph builder
+        self.graph_builder = ArchitectureGraphBuilder(ve_cutoff=ve_cutoff)
+
+        # Architecture encoder
+        self.arch_encoder = ArchitectureEncoder(
+            embedding_dim=arch_embed_dim,
+            hidden_dim=hidden_dim // 2,
+            ve=True,
+            layernorm=True
+        ).to(device)
 
         # Task encoder
-        self.task_encoder = TaskEncoder(embedding_dim=task_embed_dim, backbone=backbone)
+        self.task_encoder = TaskEncoder(
+            feature_extractor=self.backbone,
+            embedding_dim=task_embed_dim
+        ).to(device)
 
-        # Replace standard decoder with task-aware decoder
-        if decoder == 'conv':
-            fn_dec, layers = ConvDecoder, (hid * 4, hid * 8)
-        elif decoder == 'mlp':
-            fn_dec, layers = MLPDecoder, (hid * 2,)
-        else:
-            raise NotImplementedError(decoder)
+        # Joint parameter generator
+        self.param_generator = JointParameterGenerator(
+            arch_dim=arch_embed_dim,
+            task_dim=task_embed_dim,
+            hidden_dim=hidden_dim
+        ).to(device)
 
-    def forward(self, nets_torch, support_data=None, graphs=None, return_embeddings=False,
-                predict_class_layers=True, bn_train=True):
-        """Predict parameters for networks based on architecture and task data."""
-        # Create task embedding if support data is provided
-        device = next(self.parameters()).device
-        task_embedding = None
-        if support_data is not None:
-            #support_images, _ = support_data
-            task_embedding = self.task_encoder(support_data)
-        #support_images = support_images.to(device)
-        #support_labels = support_labels.to(device)
+        # Adaptation modules (parameters will be predicted by GHN)
+        self.adapt_layer1 = AdaptationModule(64).to(device)
+        self.adapt_layer2 = AdaptationModule(128).to(device)
+        self.adapt_layer3 = AdaptationModule(256).to(device)
+        self.adapt_layer4 = AdaptationModule(512).to(device)
 
-        # Use parent GHN to predict parameters, but NOT classification layer
-        with torch.no_grad():
-            super().forward(
-                nets_torch,
-                graphs=graphs,
-                return_embeddings=False,
-                predict_class_layers=False,  # Important: don't predict classification
-                bn_train=bn_train
-            )
+        # Final classification layer
+        self.classifier = nn.Linear(feature_dim, num_classes).to(device)
 
-        # Process networks
-        networks = nets_torch if isinstance(nets_torch, list) else [nets_torch]
+        # Cache for architecture embeddings
+        self.arch_embedding_cache = {}
+        self.simple_projection = nn.Linear(9, self.arch_embed_dim).to(device)
+        nn.init.orthogonal_(self.simple_projection.weight)
 
-        # Wrap each network to preserve gradients
-        wrapped_networks = []
-        for net in networks:
-            # Set batch norm layers to proper mode if needed
-            if bn_train and not net.training:
-                def set_bn_train(module):
-                    if isinstance(module, nn.BatchNorm2d):
-                        module.training = True
-
-                net.apply(set_bn_train)
-
-            wrapped_net = GradientPreservingWrapper(
-                net,
-                self.task_encoder,
-                task_embedding,
-                self.num_classes
-            )
-            wrapped_networks.append(wrapped_net)
-
-        result = wrapped_networks if isinstance(nets_torch, list) else wrapped_networks[0]
-        return (result, None) if return_embeddings else result
-
-    @staticmethod
-    def load(checkpoint_path, debug_level=1, device=default_device(), verbose=False):
+    def encode_architecture_simple(self, network):
         """
-        Load TaskAwareGHN from checkpoint.
+        A simplified architecture encoding that doesn't rely on autograd.
+        """
+        # Generate a fixed embedding based on network characteristics
+        network_id = id(network)
+        if network_id in self.arch_embedding_cache:
+            return self.arch_embedding_cache[network_id]
+
+        # Create a feature vector describing the architecture
+        arch_features = []
+
+        # Count layers by type
+        layer_counts = {}
+        for name, module in network.named_modules():
+            layer_type = type(module).__name__
+            if layer_type not in layer_counts:
+                layer_counts[layer_type] = 0
+            layer_counts[layer_type] += 1
+
+        # Network depth features
+        if hasattr(network, 'layer1'):
+            arch_features.append(len(network.layer1))
+        else:
+            arch_features.append(0)
+
+        if hasattr(network, 'layer2'):
+            arch_features.append(len(network.layer2))
+        else:
+            arch_features.append(0)
+
+        if hasattr(network, 'layer3'):
+            arch_features.append(len(network.layer3))
+        else:
+            arch_features.append(0)
+
+        if hasattr(network, 'layer4'):
+            arch_features.append(len(network.layer4))
+        else:
+            arch_features.append(0)
+
+        # Layer type distribution features
+        for layer_type in ['Conv2d', 'BatchNorm2d', 'Linear', 'MaxPool2d', 'AvgPool2d']:
+            arch_features.append(layer_counts.get(layer_type, 0))
+
+        # Convert to tensor and normalize
+        arch_features = torch.tensor(arch_features, dtype=torch.float32, device=self.device)
+        arch_features = arch_features / (arch_features.sum() + 1e-6)
+
+        # Project to the right dimension
+        simple_projection = nn.Linear(len(arch_features), self.arch_embed_dim).to(self.device)
+        nn.init.orthogonal_(simple_projection.weight)
+
+        # Generate embedding
+        with torch.no_grad():
+            arch_embedding = simple_projection(arch_features)
+
+        # Cache the embedding
+        self.arch_embedding_cache[network_id] = arch_embedding
+
+        return arch_embedding
+
+    def encode_architecture(self, network):
+        """
+        Encode network architecture into embedding.
+        Uses caching for efficiency.
+        """
+        # Check if architecture is in cache
+        network_id = id(network)
+        if network_id in self.arch_embedding_cache:
+            return self.arch_embedding_cache[network_id]
+
+        try:
+            graph = self.graph_builder.build_graph(network)
+            graph_batch = GraphBatch([graph]).to_device(self.device)
+
+            with torch.no_grad():
+                arch_embeddings = self.arch_encoder(graph_batch)
+                arch_embedding = arch_embeddings[0]
+
+            # Cache the embedding
+            self.arch_embedding_cache[network_id] = arch_embedding
+            return arch_embedding
+
+        except Exception as e:
+            # Return a default embedding as fallback
+            return torch.zeros(self.arch_embed_dim, device=self.device)
+
+    def encode_task(self, support_images, support_labels):
+        """
+        Extract task representation from support set.
 
         Args:
-            checkpoint_path: Path to checkpoint
-            debug_level: Level of debug information
-            device: Device to load model on
-            verbose: Whether to print verbose information
+            support_images: Tensor of support images
+            support_labels: Tensor of support labels
 
         Returns:
-            Loaded TaskAwareGHN model
+            Task embedding tensor
         """
-        state_dict = torch.load(checkpoint_path, map_location=device)
+        return self.task_encoder(support_images, support_labels, self.num_classes)
 
-        # Check if this is a TaskAwareGHN checkpoint
-        is_ta_ghn = 'task_embed_dim' in state_dict['config']
+    def set_adaptation_params(self, arch_embedding, task_embedding):
+        """
+        Use parameter generator to predict parameters for all adaptation modules.
 
-        if is_ta_ghn:
-            ghn = TaskAwareGHN(**state_dict['config'], debug_level=debug_level).to(device).eval()
+        Args:
+            arch_embedding: Architecture embedding tensor
+            task_embedding: Task embedding tensor
+        """
+        # Generate parameters for each adaptation module
+        params_layer1 = self.param_generator(arch_embedding, task_embedding, 64)
+        params_layer2 = self.param_generator(arch_embedding, task_embedding, 128)
+        params_layer3 = self.param_generator(arch_embedding, task_embedding, 256)
+        params_layer4 = self.param_generator(arch_embedding, task_embedding, 512)
+
+        # Set parameters for adaptation modules
+        self._set_module_params(self.adapt_layer1, params_layer1)
+        self._set_module_params(self.adapt_layer2, params_layer2)
+        self._set_module_params(self.adapt_layer3, params_layer3)
+        self._set_module_params(self.adapt_layer4, params_layer4)
+
+    def _set_module_params(self, module, params_dict):
+        """
+        Helper to set parameters for a module.
+
+        Args:
+            module: Target module to update
+            params_dict: Dictionary of parameter tensors
+        """
+        for name, param in params_dict.items():
+            param_obj = module
+            name_parts = name.split('.')
+
+            # Navigate to the correct attribute
+            for part in name_parts[:-1]:
+                param_obj = getattr(param_obj, part)
+
+            # Get original parameter to ensure correct shape
+            original_param = getattr(param_obj, name_parts[-1])
+
+            # Ensure the parameter has the right shape
+            if param.shape != original_param.shape:
+                param = param.reshape(original_param.shape)
+
+            # Set the parameter
+            setattr(param_obj, name_parts[-1], nn.Parameter(param))
+
+    def forward(self, query_images, arch_embedding=None, task_embedding=None):
+        """
+        Process query images with task-specific and architecture-aware adaptation.
+
+        Args:
+            query_images: Query images tensor
+            arch_embedding: Architecture embedding tensor (optional)
+            task_embedding: Task embedding tensor (optional)
+
+        Returns:
+            Class logits for query images
+        """
+        if arch_embedding is not None and task_embedding is not None:
+            # Use arch and task embeddings to predict adaptation module parameters
+            self.set_adaptation_params(arch_embedding, task_embedding)
+
+        # First part of ResNet
+        x = self.backbone.conv1(query_images)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+
+        # Layer 1 with adaptation
+        x = self.backbone.layer1(x)
+        x = self.adapt_layer1(x, spatial_dims=(x.size(2), x.size(3)))
+
+        # Layer 2 with adaptation
+        x = self.backbone.layer2(x)
+        x = self.adapt_layer2(x, spatial_dims=(x.size(2), x.size(3)))
+
+        # Layer 3 with adaptation
+        x = self.backbone.layer3(x)
+        x = self.adapt_layer3(x, spatial_dims=(x.size(2), x.size(3)))
+
+        # Layer 4 with adaptation
+        x = self.backbone.layer4(x)
+        x = self.adapt_layer4(x, spatial_dims=(x.size(2), x.size(3)))
+
+        # Global pooling and classification
+        x = self.backbone.avgpool(x)
+        features = torch.flatten(x, 1)
+        return self.classifier(features)
+
+class AdaptationModule(nn.Module):
+    """
+    A lightweight adaptation module whose parameters
+    will be generated by the GHN.
+    """
+
+    def __init__(self, in_channels, reduction=4):
+        super().__init__()
+        self.in_channels = in_channels
+        self.reduction = reduction
+        self.mid_channels = in_channels // reduction
+
+        # These parameters will be predicted by GHN
+        self.fc1 = nn.Linear(in_channels, self.mid_channels)
+        self.fc2 = nn.Linear(self.mid_channels, in_channels)
+
+    def forward(self, x, spatial_dims=None):
+        # Global average pooling
+        b, c = x.shape[0], x.shape[1]
+        y = F.adaptive_avg_pool2d(x, 1).view(b, c)  # Flatten to [batch_size, channels]
+
+        # Channel attention
+        y = F.relu(self.fc1(y))
+        y = torch.sigmoid(self.fc2(y))
+
+        # Apply attention weights (reshape to match spatial dimensions)
+        return x * y.view(b, c, 1, 1)
+
+class MiniGHN(nn.Module):
+    """
+    A simplified GHN that predicts parameters for lightweight adaptation modules.
+    """
+
+    def __init__(self, task_dim=128, hidden_dim=64):
+        super().__init__()
+        self.task_dim = task_dim
+        self.hidden_dim = hidden_dim
+
+        # Task feature processing
+        self.task_encoder = nn.Sequential(
+            nn.Linear(task_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        # Parameter generation networks for different channel sizes
+        self.decoders = nn.ModuleDict({
+            '64': self._create_decoder(64),
+            '128': self._create_decoder(128),
+            '256': self._create_decoder(256),
+            '512': self._create_decoder(512)
+        })
+
+    # Replace the _create_decoder method in MiniGHN with this version:
+    # Replace the _create_decoder method with this version
+    def _create_decoder(self, channels):
+        """Create a decoder for generating adaptation module parameters."""
+        reduction = 4
+        mid_channels = channels // reduction
+
+        class CustomDecoder(nn.Module):
+            def __init__(self, in_features, hidden_dim, out_shape):
+                super().__init__()
+                self.fc = nn.Sequential(
+                    nn.Linear(in_features, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, np.prod(out_shape))
+                )
+                self.out_shape = out_shape
+
+            def forward(self, x):
+                return self.fc(x).reshape(-1, *self.out_shape)
+
+        decoder = nn.ModuleDict({
+            'fc1_weight': CustomDecoder(
+                self.hidden_dim, self.hidden_dim * 2, (mid_channels, channels)
+            ),
+            'fc1_bias': CustomDecoder(
+                self.hidden_dim, self.hidden_dim, (mid_channels,)
+            ),
+            'fc2_weight': CustomDecoder(
+                self.hidden_dim, self.hidden_dim * 2, (channels, mid_channels)
+            ),
+            'fc2_bias': CustomDecoder(
+                self.hidden_dim, self.hidden_dim, (channels,)
+            )
+        })
+
+        return decoder
+
+    def forward(self, task_embedding, channel_size):
+        """
+        Generate parameters for an adaptation module with the given channel size.
+
+        Args:
+            task_embedding: Task-specific embedding
+            channel_size: Number of channels (64, 128, 256, or 512)
+
+        Returns:
+            Dictionary of parameters for the adaptation module
+        """
+        # Process task embedding
+        h = self.task_encoder(task_embedding)
+
+        # Get the appropriate decoder for the channel size
+        decoder = self.decoders[str(channel_size)]
+
+        # Generate parameters
+        params = {
+            'fc1.weight': decoder['fc1_weight'](h),
+            'fc1.bias': decoder['fc1_bias'](h),
+            'fc2.weight': decoder['fc2_weight'](h),
+            'fc2.bias': decoder['fc2_bias'](h)
+        }
+
+        return params
+
+class HybridGHNNetwork(nn.Module):
+
+    def __init__(self, feature_dim=512, task_embed_dim=128, num_classes=5, device='cpu'):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.task_embed_dim = task_embed_dim
+        self.num_classes = num_classes
+        self.device = device
+
+        # Feature extractor (frozen ResNet backbone)
+        self.backbone = models.resnet18(pretrained=True)
+        self.backbone.fc = nn.Identity()  # Remove classification layer
+        self.backbone = self.backbone.to(device)
+
+        # Freeze backbone parameters for stability
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Task encoder (processes support set)
+        self.task_encoder = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, task_embed_dim)
+        ).to(device)
+
+        # Mini GHN for generating adaptation module parameters
+        self.ghn = MiniGHN(task_dim=task_embed_dim, hidden_dim=64).to(device)
+
+        # Adaptation modules (parameters will be predicted by GHN)
+        self.adapt_layer1 = AdaptationModule(64).to(device)
+        self.adapt_layer2 = AdaptationModule(128).to(device)
+        self.adapt_layer3 = AdaptationModule(256).to(device)
+        self.adapt_layer4 = AdaptationModule(512).to(device)
+
+        # Final classification layer
+        self.classifier = nn.Linear(feature_dim, num_classes).to(device)
+
+    def encode_task(self, support_images, support_labels):
+        """Extract task representation from support set."""
+        # Extract features from support images
+        with torch.no_grad():
+            features = self.backbone(support_images)
+
+        # Compute class prototypes
+        prototypes = []
+        for c in range(self.num_classes):
+            class_mask = (support_labels == c)
+            if class_mask.sum() > 0:
+                class_features = features[class_mask]
+                prototypes.append(class_features.mean(0))
+            else:
+                # Handle case where a class might have no examples
+                prototypes.append(torch.zeros(features.size(1), device=features.device))
+
+        if prototypes:
+            task_features = torch.stack(prototypes).mean(0)
+            return self.task_encoder(task_features)
         else:
-            # Load as regular GHN, then convert
-            temp_ghn = GHN(**state_dict['config'], debug_level=debug_level)
+            return torch.zeros(self.task_embed_dim, device=features.device)
 
-            # Create TaskAwareGHN with same config
-            ghn = TaskAwareGHN(
-                max_shape=temp_ghn.max_shape,
-                num_classes=temp_ghn.num_classes,
-                hypernet=state_dict['config'].get('hypernet', 'gatedgnn'),
-                decoder=state_dict['config'].get('decoder', 'conv'),
-                weight_norm=temp_ghn.weight_norm,
-                ve=temp_ghn.ve,
-                layernorm=temp_ghn.layernorm,
-                hid=state_dict['config'].get('hid', 32),
-                debug_level=debug_level,
-                phase=1
-            ).to(device).eval()
+    def set_adaptation_params(self, task_embedding):
+        """Use GHN to predict parameters for all adaptation modules."""
+        # Generate parameters for each adaptation module
+        params_layer1 = self.ghn(task_embedding, 64)
+        params_layer2 = self.ghn(task_embedding, 128)
+        params_layer3 = self.ghn(task_embedding, 256)
+        params_layer4 = self.ghn(task_embedding, 512)
 
-            # Copy common parameters
-            ghn_dict = temp_ghn.state_dict()
-            ta_dict = ghn.state_dict()
+        # Set parameters for adaptation modules
+        self._set_module_params(self.adapt_layer1, params_layer1)
+        self._set_module_params(self.adapt_layer2, params_layer2)
+        self._set_module_params(self.adapt_layer3, params_layer3)
+        self._set_module_params(self.adapt_layer4, params_layer4)
 
-            for k in ghn_dict.keys():
-                if k in ta_dict:
-                    ta_dict[k] = ghn_dict[k]
+    def _set_module_params(self, module, params_dict):
+        """Helper to set parameters for a module."""
+        for name, param in params_dict.items():
+            param_obj = module
+            name_parts = name.split('.')
 
-            ghn.load_state_dict(ta_dict, strict=False)
+            # Navigate to the correct attribute
+            for part in name_parts[:-1]:
+                param_obj = getattr(param_obj, part)
 
-        if verbose:
-            print(
-                f"{'TaskAwareGHN' if is_ta_ghn else 'GHN converted to TaskAwareGHN'} with {capacity(ghn)[1]} parameters loaded.")
+            # Get original parameter to ensure correct shape
+            original_param = getattr(param_obj, name_parts[-1])
 
-        return ghn
+            # Ensure the parameter has the right shape before setting it
+            if param.shape != original_param.shape:
+                param = param.reshape(original_param.shape)
 
+            # Set the parameter
+            setattr(param_obj, name_parts[-1], nn.Parameter(param))
 
-def create_ta_ghn(dataset='cifar100', phase=1, task_embed_dim=128, backbone='resnet18'):
-    """Create a task-aware GHN initialized from a pretrained GHN."""
-    path = os.path.dirname(os.path.abspath(__file__))
-    base_ghn = GHN.load(os.path.join(path, f'../../checkpoints/ghn2_{dataset}.pt'))
+    def forward(self, query_images, task_embedding=None):
+        """Process query images with task-specific adaptation."""
+        if task_embedding is not None:
+            # Use GHN to predict adaptation module parameters
+            self.set_adaptation_params(task_embedding)
 
-    # Create TaskAwareGHN to only conditions classification layer
-    ta_ghn = TaskAwareGHN(
-        max_shape=base_ghn.max_shape,
-        num_classes=base_ghn.num_classes,
-        task_embed_dim=task_embed_dim,
-        backbone=backbone,
-        hypernet='gatedgnn',
-        decoder='conv',
-        weight_norm=base_ghn.weight_norm,
-        ve=base_ghn.ve,
-        layernorm=base_ghn.layernorm,
-        hid=32,
-        debug_level=0,
-        phase=phase
-    )
+        # First part of ResNet
+        x = self.backbone.conv1(query_images)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
 
-    # Copy parameters from base GHN
-    base_dict = base_ghn.state_dict()
-    ta_dict = ta_ghn.state_dict()
+        # Layer 1 with adaptation
+        x = self.backbone.layer1(x)
+        x = self.adapt_layer1(x, spatial_dims=(x.size(2), x.size(3)))
 
-    for k in base_dict.keys():
-        if k in ta_dict:
-            ta_dict[k] = base_dict[k]
+        # Layer 2 with adaptation
+        x = self.backbone.layer2(x)
+        x = self.adapt_layer2(x, spatial_dims=(x.size(2), x.size(3)))
 
-    ta_ghn.load_state_dict(ta_dict, strict=False)
+        # Layer 3 with adaptation
+        x = self.backbone.layer3(x)
+        x = self.adapt_layer3(x, spatial_dims=(x.size(2), x.size(3)))
 
-    return ta_ghn
+        # Layer 4 with adaptation
+        x = self.backbone.layer4(x)
+        x = self.adapt_layer4(x, spatial_dims=(x.size(2), x.size(3)))
+
+        # Global pooling and classification
+        x = self.backbone.avgpool(x)
+        features = torch.flatten(x, 1)
+        return self.classifier(features)

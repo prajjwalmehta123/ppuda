@@ -1,28 +1,24 @@
 """
-Trains Task-Aware Graph HyperNetwork for few-shot learning.
+Train a Hybrid GHN-based Meta-Learning model for few-shot learning.
 
 Example:
-    # To train TA-GHN on CIFAR-100:
-    sh experiments/train_ta.sh
+    python train_ta_ghn.py
 """
 import argparse
 import os
 import torch
 import numpy as np
+import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
-from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
-import wandb
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+import torchvision.models as models
+import wandb
 
-from ppuda.config import init_config
-from ppuda.deepnets1m.loader import DeepNets1M
-from ppuda.deepnets1m.net import Network
-from ppuda.utils import capacity
-from ppuda.ghn.task_aware_ghn import TaskAwareGHN, create_ta_ghn
+from ppuda.ghn.task_aware_ghn import HybridGHNNetwork, ArchitectureAwareGHN
 from ppuda.task.task_sampler import TaskSampler, ClassSubset
-
 
 def get_dataset(dataset_name, data_dir, is_train=True):
     """Get dataset for few-shot learning."""
@@ -52,22 +48,15 @@ def get_dataset(dataset_name, data_dir, is_train=True):
             download=True,
             transform=transform
         )
+
+    elif dataset_name == 'miniimagenet':
+        # Add MiniImageNet support here if needed
+        raise NotImplementedError("MiniImageNet dataset not implemented yet")
+
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
 
     return dataset
-
-def get_optimizer(model, lr, weight_decay):
-    """Create optimizer that only updates task-specific components."""
-    # Only train task encoder and classification layer projection
-    task_params = []
-    for name, param in model.named_parameters():
-        # Only train task encoder and related components
-        if 'task_encoder' in name and param.requires_grad:
-            task_params.append(param)
-
-    print(f"Training {len(task_params)} task-specific parameters")
-    return torch.optim.Adam(task_params, lr=lr, weight_decay=weight_decay)
 
 def collate_task_batch(tasks, dataset):
     """Collate a batch of tasks into properly structured tensors."""
@@ -94,7 +83,7 @@ def collate_task_batch(tasks, dataset):
             # Map original label to task-specific class index
             query_labels.append(class_to_idx[label])
 
-    # Stack tensors - make sure these are proper tensors, not tuples
+    # Stack tensors
     support_images = torch.stack(support_images)
     support_labels = torch.tensor(support_labels)
     query_images = torch.stack(query_images)
@@ -108,24 +97,372 @@ def compute_accuracy(logits, targets):
     correct = (preds == targets).float().sum()
     return correct.item() / targets.size(0)
 
-def main():
-    """Main training function."""
-    # Initialize configuration
-    parser = argparse.ArgumentParser(description='Train Task-Aware GHN')
-    parser.add_argument('--n_way', type=int, default=5, help='N-way classification')
-    parser.add_argument('--k_shot', type=int, default=1, help='K-shot learning')
-    parser.add_argument('--query_size', type=int, default=15, help='Number of query examples per class')
-    parser.add_argument('--task_embed_dim', type=int, default=128, help='Task embedding dimension')
-    parser.add_argument('--backbone', type=str, default='resnet18', help='Backbone for task encoder')
-    parser.add_argument('--steps_per_epoch', type=int, default=100, help='Number of steps per epoch')
-    parser.add_argument('--val_steps', type=int, default=50, help='Number of validation steps')
-    parser.add_argument('--arch_batch_size', type=int, default=1, help='Number of architectures per task')
-    parser.add_argument('--wandb_project', type=str, default='ta-ghn', help='Weights & Biases project name')
-    parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity/username')
-    parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
-    parser.add_argument('--debug_mode', action='store_true', help='Enable debug mode with fewer steps')
+def train_with_architecture_variety(model, train_dataset, train_sampler, networks, optimizer, device, args):
+    """
+    Train with a variety of architectures to improve generalization.
 
-    args = init_config(mode='train_ghn', parser=parser)
+    Args:
+        model: ArchitectureAwareGHN model
+        train_dataset: Training dataset
+        train_sampler: Task sampler
+        networks: List of different network architectures
+        optimizer: Optimizer
+        device: Device to use
+        args: Training arguments
+
+    Returns:
+        Tuple of (average loss, average accuracy)
+    """
+    model.train()
+    train_losses = []
+    train_accs = []
+
+    train_iter = tqdm(range(args.steps_per_epoch), desc=f"Training")
+    for step in train_iter:
+        # Sample tasks
+        tasks = train_sampler.sample_batch(args.meta_batch_size)
+        support_images, support_labels, query_images, query_labels = collate_task_batch(tasks, train_dataset)
+
+        # Move data to device
+        support_images = support_images.to(device)
+        support_labels = support_labels.to(device)
+        query_images = query_images.to(device)
+        query_labels = query_labels.to(device)
+
+        # Forward pass and compute loss
+        optimizer.zero_grad()
+
+        # For each task, use a different architecture
+        batch_losses = []
+        batch_accs = []
+
+        for i in range(args.meta_batch_size):
+            # Get task-specific data
+            start_idx = i * args.n_way * args.k_shot
+            end_idx = (i + 1) * args.n_way * args.k_shot
+            task_support_images = support_images[start_idx:end_idx]
+            task_support_labels = support_labels[start_idx:end_idx]
+
+            start_idx = i * args.n_way * args.query_size
+            end_idx = (i + 1) * args.n_way * args.query_size
+            task_query_images = query_images[start_idx:end_idx]
+            task_query_labels = query_labels[start_idx:end_idx]
+
+            # Sample a random network architecture
+            network_idx = np.random.randint(len(networks))
+            network = networks[network_idx].to(device)
+
+            # Encode architecture
+            arch_embedding = model.encode_architecture_simple(network)
+
+            # Set the current architecture as the backbone temporarily
+            original_backbone = model.backbone
+            model.backbone = network
+
+            # Encode task from support set
+            task_embedding = model.encode_task(task_support_images, task_support_labels)
+
+            # Restore original backbone
+            model.backbone = original_backbone
+
+            # Get predictions on query set
+            query_logits = model(task_query_images, arch_embedding, task_embedding)
+            loss = F.cross_entropy(query_logits, task_query_labels)
+
+            # Calculate accuracy
+            acc = compute_accuracy(query_logits, task_query_labels)
+
+            batch_losses.append(loss)
+            batch_accs.append(acc)
+
+        # Average loss across tasks
+        loss = torch.mean(torch.stack(batch_losses))
+
+        # Backward pass
+        loss.backward()
+
+        # Gradient clipping
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+        optimizer.step()
+
+        train_losses.append(loss.item())
+        train_accs.append(np.mean(batch_accs))
+
+        # Update tqdm progress bar
+        train_iter.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'acc': f"{np.mean(batch_accs):.4f}"
+        })
+
+    return np.mean(train_losses), np.mean(train_accs)
+
+def evaluate_arch_aware(model, val_dataset, val_sampler, device, args):
+    """
+    Evaluate architecture-aware model.
+
+    Args:
+        model: ArchitectureAwareGHN model
+        val_dataset: Validation dataset
+        val_sampler: Task sampler
+        device: Device to use
+        args: Evaluation arguments
+
+    Returns:
+        Tuple of (average loss, average accuracy)
+    """
+    model.eval()
+    val_losses = []
+    val_accs = []
+
+    with torch.no_grad():
+        val_iter = tqdm(range(args.val_steps), desc=f"Validation")
+        for step in val_iter:
+            # Sample tasks
+            tasks = val_sampler.sample_batch(args.meta_batch_size)
+            support_images, support_labels, query_images, query_labels = collate_task_batch(tasks, val_dataset)
+
+            # Move data to device
+            support_images = support_images.to(device)
+            support_labels = support_labels.to(device)
+            query_images = query_images.to(device)
+            query_labels = query_labels.to(device)
+
+            batch_losses = []
+            batch_accs = []
+
+            for i in range(args.meta_batch_size):
+                # Get task-specific data
+                start_idx = i * args.n_way * args.k_shot
+                end_idx = (i + 1) * args.n_way * args.k_shot
+                task_support_images = support_images[start_idx:end_idx]
+                task_support_labels = support_labels[start_idx:end_idx]
+
+                start_idx = i * args.n_way * args.query_size
+                end_idx = (i + 1) * args.n_way * args.query_size
+                task_query_images = query_images[start_idx:end_idx]
+                task_query_labels = query_labels[start_idx:end_idx]
+
+                # Encode architecture
+                arch_embedding = model.encode_architecture_simple(model.backbone)
+
+                # Encode task from support set
+                task_embedding = model.encode_task(task_support_images, task_support_labels)
+
+                # Get predictions on query set
+                query_logits = model(task_query_images, arch_embedding, task_embedding)
+                loss = F.cross_entropy(query_logits, task_query_labels)
+
+                # Calculate accuracy
+                acc = compute_accuracy(query_logits, task_query_labels)
+
+                batch_losses.append(loss.item())
+                batch_accs.append(acc)
+
+            val_loss_step = np.mean(batch_losses)
+            val_acc_step = np.mean(batch_accs)
+            val_losses.append(val_loss_step)
+            val_accs.append(val_acc_step)
+
+            # Update tqdm progress bar
+            val_iter.set_postfix({
+                'loss': f"{val_loss_step:.4f}",
+                'acc': f"{val_acc_step:.4f}"
+            })
+
+    return np.mean(val_losses), np.mean(val_accs)
+
+def create_network_family():
+    """
+    Create a family of different network architectures for training.
+    """
+    networks = []
+
+    # ResNet variants
+    networks.append(models.resnet18(pretrained=True))
+    networks.append(models.resnet34(pretrained=True))
+
+    # DenseNet variant
+    networks.append(models.densenet121(pretrained=True))
+
+    # MobileNet variant
+    networks.append(models.mobilenet_v2(pretrained=True))
+
+    # Ensure all networks have proper output handling
+    for net in networks:
+        if hasattr(net, 'fc'):
+            net.fc = nn.Identity()
+        elif hasattr(net, 'classifier'):
+            if isinstance(net.classifier, nn.Sequential):
+                net.classifier[-1] = nn.Identity()
+            else:
+                net.classifier = nn.Identity()
+
+    return networks
+
+
+def evaluate_cross_domain(model, test_dataset, test_sampler, networks, device, args):
+    """
+    Evaluate cross-domain generalization.
+    """
+    model.eval()
+    results = {}
+
+    for net_idx, network in enumerate(networks):
+        net_name = type(network).__name__
+        test_losses = []
+        test_accs = []
+
+        with torch.no_grad():
+            test_iter = tqdm(range(args.test_steps), desc=f"Testing with {net_name}")
+            for step in test_iter:
+                # Sample tasks
+                tasks = test_sampler.sample_batch(args.meta_batch_size)
+                support_images, support_labels, query_images, query_labels = collate_task_batch(tasks, test_dataset)
+
+                # Move data to device
+                support_images = support_images.to(device)
+                support_labels = support_labels.to(device)
+                query_images = query_images.to(device)
+                query_labels = query_labels.to(device)
+
+                batch_losses = []
+                batch_accs = []
+
+                for i in range(args.meta_batch_size):
+                    # Get task-specific data
+                    start_idx = i * args.n_way * args.k_shot
+                    end_idx = (i + 1) * args.n_way * args.k_shot
+                    task_support_images = support_images[start_idx:end_idx]
+                    task_support_labels = support_labels[start_idx:end_idx]
+
+                    start_idx = i * args.n_way * args.query_size
+                    end_idx = (i + 1) * args.n_way * args.query_size
+                    task_query_images = query_images[start_idx:end_idx]
+                    task_query_labels = query_labels[start_idx:end_idx]
+
+                    # Use the simple architecture encoder for stability
+                    network = network.to(device)
+                    arch_embedding = model.encode_architecture_simple(network)
+
+                    # Set the current architecture as the backbone temporarily
+                    original_backbone = model.backbone
+                    model.backbone = network
+
+                    # Encode task from support set
+                    task_embedding = model.encode_task(task_support_images, task_support_labels)
+
+                    # Restore original backbone
+                    model.backbone = original_backbone
+
+                    # Get predictions on query set
+                    query_logits = model(task_query_images, arch_embedding, task_embedding)
+                    loss = F.cross_entropy(query_logits, task_query_labels)
+
+                    # Calculate accuracy
+                    acc = compute_accuracy(query_logits, task_query_labels)
+
+                    batch_losses.append(loss.item())
+                    batch_accs.append(acc)
+
+                test_loss_step = np.mean(batch_losses)
+                test_acc_step = np.mean(batch_accs)
+                test_losses.append(test_loss_step)
+                test_accs.append(test_acc_step)
+
+                # Update tqdm progress bar
+                test_iter.set_postfix({
+                    'loss': f"{test_loss_step:.4f}",
+                    'acc': f"{test_acc_step:.4f}"
+                })
+        results[net_name] = {
+            'loss': np.mean(test_losses),
+            'accuracy': np.mean(test_accs)
+        }
+        print(
+            f"Results with {net_name}: Loss = {results[net_name]['loss']:.4f}, Accuracy = {results[net_name]['accuracy']:.4f}")
+    return results
+
+def main():
+    """Main training function for architecture-aware GHN."""
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Train Architecture-Aware GHN Meta-Learning Model')
+
+    # Dataset arguments
+    parser.add_argument('--dataset', type=str, default='cifar100',
+                        help='Dataset name (cifar100, miniimagenet)')
+    parser.add_argument('--data_dir', type=str, default='./data',
+                        help='Data directory')
+    parser.add_argument('--test_dataset', type=str, default=None,
+                        help='Dataset for cross-domain evaluation (cub, omniglot)')
+
+    # Model arguments
+    parser.add_argument('--arch_embed_dim', type=int, default=128,
+                        help='Architecture embedding dimension')
+    parser.add_argument('--task_embed_dim', type=int, default=128,
+                        help='Task embedding dimension')
+    parser.add_argument('--hidden_dim', type=int, default=256,
+                        help='Hidden dimension')
+    parser.add_argument('--ve_cutoff', type=int, default=50,
+                        help='Maximum shortest path length for virtual edges')
+
+    # Task arguments
+    parser.add_argument('--n_way', type=int, default=5,
+                        help='N-way classification')
+    parser.add_argument('--k_shot', type=int, default=1,
+                        help='K-shot learning')
+    parser.add_argument('--query_size', type=int, default=15,
+                        help='Number of query examples per class')
+
+    # Training arguments
+    parser.add_argument('--device', type=str, default='cpu',
+                        help='Device to use (cpu, cuda)')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Number of epochs')
+    parser.add_argument('--meta_batch_size', type=int, default=4,
+                        help='Number of tasks per batch')
+    parser.add_argument('--arch_batch_size', type=int, default=2,
+                        help='Number of architectures to use per step')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate')
+    parser.add_argument('--wd', type=float, default=0.0001,
+                        help='Weight decay')
+    parser.add_argument('--scheduler', type=str, default='cosine',
+                        help='Scheduler type (cosine, multistep)')
+    parser.add_argument('--steps_per_epoch', type=int, default=100,
+                        help='Steps per epoch')
+    parser.add_argument('--val_steps', type=int, default=30,
+                        help='Validation steps')
+    parser.add_argument('--test_steps', type=int, default=50,
+                        help='Testing steps')
+    parser.add_argument('--grad_clip', type=float, default=5.0,
+                        help='Gradient clipping')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed')
+
+    # Logging and saving arguments
+    parser.add_argument('--save', type=str, default='./checkpoints/arch_aware_ghn',
+                        help='Directory to save checkpoints')
+    parser.add_argument('--log_interval', type=int, default=10,
+                        help='Log interval')
+    parser.add_argument('--use_wandb', action='store_true',
+                        help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb_project', type=str, default='arch-aware-ghn',
+                        help='Weights & Biases project name')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                        help='Weights & Biases entity/username')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of data loader workers')
+
+    args = parser.parse_args()
+
+    # Set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    # Create save directory if it doesn't exist
+    os.makedirs(args.save, exist_ok=True)
 
     # Initialize wandb if enabled
     if args.use_wandb:
@@ -133,25 +470,17 @@ def main():
             project=args.wandb_project,
             entity=args.wandb_entity,
             config=vars(args),
-            name=f"{args.n_way}way_{args.k_shot}shot_{args.backbone}"
+            name=f"arch_aware_ghn_{args.n_way}way_{args.k_shot}shot"
         )
-        # Log gradients and model parameters
-        wandb.watch_called = False
 
-    # Debug mode for quick testing
-    if args.debug_mode:
-        print("Debug mode enabled: using reduced training steps")
-        args.steps_per_epoch = min(5, args.steps_per_epoch)
-        args.val_steps = min(3, args.val_steps)
+    # Set device
+    device = torch.device(args.device)
 
-    # Set random seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # Load dataset
+    dataset = get_dataset(args.dataset, args.data_dir, is_train=True)
 
+    # Split dataset for few-shot learning
     if args.dataset == 'cifar100':
-        dataset = get_dataset(args.dataset, args.data_dir, is_train=True)
-
-        # Split dataset for few-shot learning
         train_classes = list(range(80))
         val_classes = list(range(80, 90))
         test_classes = list(range(90, 100))
@@ -179,228 +508,67 @@ def main():
         seed=args.seed + 1  # Different seed for validation
     )
 
-    # Create graph loader for architectures
-    is_imagenet = args.dataset == 'imagenet'
-    graphs_queue = DeepNets1M.loader(
-        args.arch_batch_size,
-        split=args.split,
-        nets_dir=args.data_dir,
-        virtual_edges=args.virtual_edges,
-        num_nets=args.num_nets,
-        large_images=is_imagenet
+    # Create network family for architecture variety
+    networks = create_network_family()
+
+    # Create model
+    model = ArchitectureAwareGHN(
+        arch_embed_dim=args.arch_embed_dim,
+        task_embed_dim=args.task_embed_dim,
+        hidden_dim=args.hidden_dim,
+        num_classes=args.n_way,
+        device=device,
+        ve_cutoff=args.ve_cutoff
+    ).to(device)
+
+    # Pre-cache architecture embeddings for all networks
+    for network in [model.backbone] + networks:
+        with torch.no_grad():
+            _ = model.encode_architecture_simple(network)
+
+    # Create optimizer
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.wd
     )
 
-    # Create or load Task-Aware GHN
-    start_epoch = 0
-    if args.ckpt is not None:
-        # Load from checkpoint
-        model = TaskAwareGHN.load(
-            args.ckpt,
-            debug_level=args.debug,
-            device=args.device,
-            verbose=True
-        )
-        state_dict = torch.load(args.ckpt, map_location=args.device)
-        if 'epoch' in state_dict:
-            start_epoch = state_dict['epoch'] + 1
-    else:
-        # Create new model
-        model = create_ta_ghn(
-            dataset=args.dataset,
-            phase=1,
-            task_embed_dim=args.task_embed_dim,
-            backbone=args.backbone
-        )
-        model = model.to(args.device)
-
-    # Watch model with wandb (track gradients and parameters)
-    if args.use_wandb and not wandb.watch_called:
-        wandb.watch(model, log="all", log_freq=args.log_interval)
-        wandb.watch_called = True
-
-    # Create optimizer - only train task encoder parameters
-    optimizer = get_optimizer(model, args.lr, args.wd)
-
-    # Load optimizer state if available
-    if args.ckpt is not None and 'optimizer' in state_dict:
-        try:
-            optimizer.load_state_dict(state_dict['optimizer'])
-        except Exception as e:
-            print(f"Warning: Could not load optimizer state: {e}")
-
     # Create scheduler
-    if args.scheduler == 'multistep':
-        scheduler = MultiStepLR(
+    if args.scheduler == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            milestones=args.lr_steps,
-            gamma=args.gamma
+            T_max=args.epochs
         )
     else:
-        scheduler = CosineAnnealingLR(
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer,
-            T_max=args.epochs,
-            eta_min=args.lr / 100
+            milestones=[args.epochs // 3, args.epochs * 2 // 3],
+            gamma=0.1
         )
 
-    if start_epoch > 0:
-        for _ in range(start_epoch):
-            scheduler.step()
-
-    print(f"Starting training Task-Aware GHN with {capacity(model)[1]} parameters!")
+    # Print training info
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Training Architecture-Aware GHN with {num_trainable_params} trainable parameters!")
     print(f"Training on {args.n_way}-way {args.k_shot}-shot tasks")
 
     # Training loop
     best_val_acc = 0.0
-    for epoch in range(start_epoch, args.epochs):
-        print(f"\nEpoch {epoch+1}/{args.epochs} - LR: {scheduler.get_last_lr()[0]:.6f}")
-        # Training
-        model.train()
-        train_losses = []
-        train_accs = []
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch + 1}/{args.epochs} - LR: {scheduler.get_last_lr()[0]:.6f}")
 
-        # Use tqdm for progress tracking
-        train_iter = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch+1} (Train)")
-        for step in train_iter:
-            # Sample tasks
-            tasks = train_sampler.sample_batch(args.meta_batch_size)
-            tasks_data = collate_task_batch(tasks, train_dataset)
-            support_images, support_labels, query_images, query_labels = tasks_data
-
-            # Get next architecture batch
-            graphs = next(graphs_queue)
-
-            # Create networks
-            nets_torch = []
-            for nets_args in graphs.net_args:
-                net = Network(is_imagenet_input=is_imagenet, num_classes=args.n_way, light=True, **nets_args)
-                nets_torch.append(net)
-
-            # Forward/backward pass
-            optimizer.zero_grad()
-            batch_losses = []
-            batch_accs = []
-
-            for net in nets_torch:
-                support_data = (support_images.to(args.device), support_labels.to(args.device))
-                query_data = (query_images.to(args.device), query_labels.to(args.device))
-
-                # Task-conditioned parameter prediction
-                wrapped_net = model(
-                    net,
-                    support_data=(support_data, support_labels.to(args.device)),
-                    graphs=graphs.to_device(args.device)
-                )
-
-                # Evaluate on query set
-                query_logits = wrapped_net(query_images.to(args.device))
-                if isinstance(query_logits, tuple):
-                    query_logits = query_logits[0]
-                loss = F.cross_entropy(query_logits, query_labels.to(args.device))
-
-                # Calculate accuracy
-                acc = compute_accuracy(query_logits, query_labels.to(args.device))
-
-                batch_losses.append(loss)
-                batch_accs.append(acc)
-
-            # Average loss across architectures
-            loss = torch.mean(torch.stack(batch_losses))
-            acc = np.mean(batch_accs)
-
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-
-            train_losses.append(loss.item())
-            train_accs.append(acc)
-
-            # Update tqdm progress bar
-            train_iter.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'acc': f"{acc:.4f}"
-            })
-
-            # Log metrics to wandb
-            if args.use_wandb and step % args.log_interval == 0:
-                wandb.log({
-                    "train/step": epoch * args.steps_per_epoch + step,
-                    "train/loss": loss.item(),
-                    "train/accuracy": acc,
-                    "train/lr": scheduler.get_last_lr()[0]
-                })
-
-        # Calculate training metrics
-        train_loss = np.mean(train_losses)
-        train_acc = np.mean(train_accs)
+        # Training with architecture variety
+        train_loss, train_acc = train_with_architecture_variety(
+            model, train_dataset, train_sampler, networks, optimizer, device, args
+        )
         print(f"Training - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
 
         # Validation
-        model.eval()
-        val_losses = []
-        val_accs = []
-
-        with torch.no_grad():
-            val_iter = tqdm(range(args.val_steps), desc=f"Epoch {epoch+1} (Val)")
-            for step in val_iter:
-                # Sample validation tasks
-                tasks = val_sampler.sample_batch(args.meta_batch_size)
-                tasks_data = collate_task_batch(tasks, val_dataset)
-                support_images, support_labels, query_images, query_labels = tasks_data
-
-                # Get next architecture batch
-                graphs = next(graphs_queue)
-
-                # Create networks
-                nets_torch = []
-                for nets_args in graphs.net_args:
-                    net = Network(
-                        is_imagenet_input=is_imagenet,
-                        num_classes=args.n_way,
-                        light=False,
-                        **nets_args
-                    )
-                    nets_torch.append(net)
-
-                batch_losses = []
-                batch_accs = []
-
-                for net in nets_torch:
-                    # Task-conditioned parameter prediction
-                    wrapped_net = model(
-                        net,
-                        support_data=(support_images.to(args.device), support_labels.to(args.device)),
-                        graphs=graphs.to_device(args.device)
-                    )
-
-                    # Evaluate on query set
-                    query_output = wrapped_net(query_images.to(args.device))
-                    query_logits = query_output[0] if isinstance(query_output, tuple) else query_output
-                    loss = F.cross_entropy(query_logits, query_labels.to(args.device))
-
-                    # Calculate accuracy
-                    acc = compute_accuracy(query_logits, query_labels.to(args.device))
-
-                    batch_losses.append(loss.item())
-                    batch_accs.append(acc)
-
-                val_loss_step = np.mean(batch_losses)
-                val_acc_step = np.mean(batch_accs)
-                val_losses.append(val_loss_step)
-                val_accs.append(val_acc_step)
-
-                # Update tqdm progress bar
-                val_iter.set_postfix({
-                    'loss': f"{val_loss_step:.4f}",
-                    'acc': f"{val_acc_step:.4f}"
-                })
-
-        # Calculate validation metrics
-        val_loss = np.mean(val_losses)
-        val_acc = np.mean(val_accs)
+        val_loss, val_acc = evaluate_arch_aware(
+            model, val_dataset, val_sampler, device, args
+        )
         print(f"Validation - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
 
-        # Log epoch metrics to wandb
+        # Log metrics to wandb
         if args.use_wandb:
             wandb.log({
                 "epoch": epoch + 1,
@@ -412,54 +580,36 @@ def main():
             })
 
         # Save checkpoint
-        if args.save:
-            checkpoint_path = os.path.join(args.save, f"ta_ghn_epoch_{epoch + 1}.pt")
+        checkpoint_path = os.path.join(args.save, f"model_epoch_{epoch + 1}.pt")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': val_loss,
+            'val_acc': val_acc
+        }, checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}")
+
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_path = os.path.join(args.save, "model_best.pt")
             torch.save({
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
-                'config': {
-                    'max_shape': model.max_shape,
-                    'num_classes': model.num_classes,
-                    'task_embed_dim': model.task_embed_dim,
-                    'hypernet': 'gatedgnn',
-                    'decoder': 'conv',
-                    'weight_norm': model.weight_norm,
-                    've': model.ve,
-                    'layernorm': model.layernorm,
-                    'hid': 32,
-                    'phase': 1  # We're using phase 1
-                }
-            }, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'train_acc': train_acc,
+                'val_loss': val_loss,
+                'val_acc': val_acc
+            }, best_path)
+            print(f"Saved best model with validation accuracy {best_val_acc:.4f}")
 
-            # Save best model
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_path = os.path.join(args.save, "ta_ghn_best.pt")
-                torch.save({
-                    'state_dict': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'epoch': epoch,
-                    'config': {
-                        'max_shape': model.max_shape,
-                        'num_classes': model.num_classes,
-                        'task_embed_dim': model.task_embed_dim,
-                        'hypernet': 'gatedgnn',
-                        'decoder': 'conv',
-                        'weight_norm': model.weight_norm,
-                        've': model.ve,
-                        'layernorm': model.layernorm,
-                        'hid': 32,
-                        'phase': 1
-                    }
-                }, best_path)
-                print(f"Saved best model with validation accuracy {best_val_acc:.4f}")
-
-                # Log best model to wandb
-                if args.use_wandb:
-                    wandb.run.summary["best_val_accuracy"] = best_val_acc
-                    wandb.run.summary["best_epoch"] = epoch + 1
+            if args.use_wandb:
+                wandb.run.summary["best_val_accuracy"] = best_val_acc
+                wandb.run.summary["best_epoch"] = epoch + 1
 
         # Update scheduler
         scheduler.step()
@@ -467,6 +617,25 @@ def main():
     print("Training completed!")
     print(f"Best validation accuracy: {best_val_acc:.4f}")
 
+    """
+    if args.test_dataset:
+        print(f"\nEvaluating cross-domain generalization on {args.test_dataset}...")
+        test_dataset = get_dataset(args.test_dataset, args.data_dir, is_train=False)
+
+        test_sampler = TaskSampler(
+            test_dataset,
+            n_way=args.n_way,
+            k_shot=args.k_shot,
+            query_size=args.query_size,
+            seed=args.seed + 2
+        )
+        cross_domain_results = evaluate_cross_domain(
+            model, test_dataset, test_sampler, networks, device, args
+        )
+        if args.use_wandb:
+            for net_name, result in cross_domain_results.items():
+                wandb.run.summary[f"cross_domain_{args.test_dataset}_{net_name}_accuracy"] = result['accuracy']
+        """
     # Finish wandb run
     if args.use_wandb:
         wandb.finish()
