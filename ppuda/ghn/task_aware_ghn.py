@@ -27,14 +27,14 @@ class GradientPreservingWrapper(nn.Module):
         else:
             self.embed_dim = 128  # Default fallback
 
-        print(f"Network feature dimension: {self.base_feature_dim}")
-        print(f"Task embedding dimension: {self.embed_dim}")
+        #print(f"Network feature dimension: {self.base_feature_dim}")
+        #print(f"Task embedding dimension: {self.embed_dim}")
 
         self.classifier = nn.Linear(self.base_feature_dim, num_classes).to(self.device)
         self.task_projection = nn.Linear(self.embed_dim, self.base_feature_dim).to(self.device)
 
-        print(f"Created task projection: {self.embed_dim} → {self.base_feature_dim}")
-        print(f"Created classifier: {self.base_feature_dim} → {num_classes}")
+        #print(f"Created task projection: {self.embed_dim} → {self.base_feature_dim}")
+        #print(f"Created classifier: {self.base_feature_dim} → {num_classes}")
 
     def _detect_feature_dim(self, net):
         """Detect the feature dimension from the network architecture."""

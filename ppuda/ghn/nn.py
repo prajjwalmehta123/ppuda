@@ -291,10 +291,12 @@ class GHN(nn.Module):
                         p.std().item(),
                         torch.norm(p).item()))
         elif self.debug_level or not self.training:
+            """
             if n_params != n_params_true:
                 print(
                     'WARNING: number of predicted ({}) or actual ({}) parameters must match'.format(
                         n_params, n_params_true))
+            """
 
         return (nets_torch, x) if return_embeddings else nets_torch
 
