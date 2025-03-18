@@ -11,28 +11,23 @@ class TaskEncoder(nn.Module):
     def __init__(self, feature_extractor, embedding_dim=128):
         super().__init__()
         self.feature_extractor = feature_extractor
-
-        # Get output dimension of feature extractor
         with torch.no_grad():
-            # Save training state and temporarily set to eval mode
             was_training = feature_extractor.training
-            feature_extractor.eval()  # This is the key fix
+            feature_extractor.eval()
+            device = next(feature_extractor.parameters()).device
+            dummy_input = torch.randn(1, 3, 32, 32, device=device)
 
-            dummy_input = torch.randn(1, 3, 32, 32)
             features = feature_extractor(dummy_input)
             if isinstance(features, tuple):
                 features = features[0]
             feature_dim = features.view(1, -1).size(1)
-
-            # Restore original training mode
             feature_extractor.train(was_training)
-
-        # Projection head to create task embedding
         self.projection = nn.Sequential(
             nn.Linear(feature_dim, 256),
             nn.ReLU(),
             nn.Linear(256, embedding_dim)
-        )
+        ).to(device)
+
 
     def forward(self, support_images, support_labels, n_way):
         """
