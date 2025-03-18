@@ -327,7 +327,10 @@ class GHN(nn.Module):
 
                     param_name = p_ if p_.endswith(('.weight', '.bias', 'in_proj_weight', 'in_proj_bias')) else p_ + '.weight'
                     try:
-                        matched = [target_modules[cell_id][param_name]]
+                        if cell_id < len(target_modules) and param_name in target_modules[cell_id]:
+                            matched = [target_modules[cell_id][param_name]]
+                        else:
+                            matched = []
                     except:
                         matched = []
 
@@ -371,14 +374,17 @@ class GHN(nn.Module):
                             mapping[key] = []
                         params_map[param_ind + node_ind] = (matched[0], key, len(mapping[key]))
                         mapping[key].append(param_ind + node_ind)
-                        del target_modules[cell_id][param_name]
+                        if cell_id < len(target_modules) and param_name in target_modules[cell_id]:
+                            del target_modules[cell_id][param_name]
 
                 # Prune redundant ops in Network by setting their params to None
-                for m in target_modules[cell_id].values():
-                    if m['is_w']:
-                        m['module'].weight = None
-                        if hasattr(m['module'], 'bias') and m['module'].bias is not None:
-                            m['module'].bias = None
+                for c_id, modules in enumerate(target_modules):
+                    if isinstance(modules, dict):
+                        for m in target_modules[cell_id].values():
+                            if m['is_w']:
+                                m['module'].weight = None
+                                if hasattr(m['module'], 'bias') and m['module'].bias is not None:
+                                    m['module'].bias = None
 
         return mapping, params_map
 
