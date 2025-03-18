@@ -467,6 +467,14 @@ class GHN(nn.Module):
         is_layer_scale = hasattr(module, 'layer_scale') and module.layer_scale is not None
         key = ('layer_scale' if is_layer_scale else 'weight' ) if is_w else 'bias'
         target_param = getattr(module, key)
+        target_param = getattr(module, key, None)
+        if target_param is None:
+            module.__dict__[key] = tensor
+            try:
+                module._parameters[key] = tensor
+            except:
+                pass
+            return tensor.shape
         if isinstance(target_param, tuple):
             sz_target = target_param
             # In lightweight networks, we just need to update the shape info
@@ -479,16 +487,26 @@ class GHN(nn.Module):
                 # In evaluation mode for lightweight networks, we just need to return the shape
                 return sz_target
         else:
-            sz_target = tuple(target_param) if isinstance(target_param, (list, tuple)) else target_param.shape
+            try:
+                sz_target = tuple(target_param) if isinstance(target_param, (list, tuple)) else target_param.shape
+            except(AttributeError, TypeError):
+                sz_target = tensor.shape
             if self.training:
                 module.__dict__[key] = tensor  # set the value avoiding the internal logic of PyTorch
                 # update parameters, so that named_parameters() will return tensors
                 # with gradients (for multigpu and other cases)
                 module._parameters[key] = tensor
             else:
-                assert isinstance(target_param, nn.Parameter), type(target_param)
-                # copy to make sure there is no sharing of memory
-                target_param.data = tensor.clone()
+                if isinstance(target_param, nn.Parameter):
+                    # copy to make sure there is no sharing of memory
+                    target_param.data = tensor.clone()
+                else:
+                    # If it's not a Parameter, just set it directly
+                    module.__dict__[key] = tensor
+                    try:
+                        module._parameters[key] = tensor
+                    except:
+                        pass
         set_param = getattr(module, key)
         if isinstance(set_param, torch.Tensor):
             try:
