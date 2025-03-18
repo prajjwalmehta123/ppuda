@@ -17,7 +17,7 @@ from tqdm import tqdm
 import torchvision.models as models
 import wandb
 
-from ppuda.ghn.task_aware_ghn import HybridGHNNetwork, ArchitectureAwareGHN
+from ppuda.ghn.task_aware_ghn import TaskAwareGHN
 from ppuda.task.task_sampler import TaskSampler, ClassSubset
 
 def get_dataset(dataset_name, data_dir, is_train=True):
@@ -102,7 +102,7 @@ def train_with_architecture_variety(model, train_dataset, train_sampler, network
     Train with a variety of architectures to improve generalization.
 
     Args:
-        model: ArchitectureAwareGHN model
+        model: TaskAwareGHN model
         train_dataset: Training dataset
         train_sampler: Task sampler
         networks: List of different network architectures
@@ -203,7 +203,7 @@ def evaluate_arch_aware(model, val_dataset, val_sampler, device, args):
     Evaluate architecture-aware model.
 
     Args:
-        model: ArchitectureAwareGHN model
+        model: TaskAwareGHN model
         val_dataset: Validation dataset
         val_sampler: Task sampler
         device: Device to use
@@ -512,7 +512,7 @@ def main():
     networks = create_network_family()
 
     # Create model
-    model = ArchitectureAwareGHN(
+    model = TaskAwareGHN(
         arch_embed_dim=args.arch_embed_dim,
         task_embed_dim=args.task_embed_dim,
         hidden_dim=args.hidden_dim,

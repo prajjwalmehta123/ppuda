@@ -1,9 +1,5 @@
 import torch
 import torch.nn as nn
-import numpy as np
-import torch.nn.functional as F
-import torchvision.models as models
-
 
 class TaskEncoder(nn.Module):
     """Encodes task data (support set) into a fixed-dimension embedding."""
@@ -32,12 +28,10 @@ class TaskEncoder(nn.Module):
     def forward(self, support_images, support_labels, n_way):
         """
         Extract task representation from support set.
-
         Args:
             support_images: Tensor of support images [B*N*K, C, H, W]
             support_labels: Tensor of support labels [B*N*K]
             n_way: Number of classes per task
-
         Returns:
             Task embedding tensor
         """
