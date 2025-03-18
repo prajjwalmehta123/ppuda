@@ -357,7 +357,7 @@ def main():
                     net = Network(
                         is_imagenet_input=is_imagenet,
                         num_classes=args.n_way,
-                        light=True,
+                        light=False,
                         **nets_args
                     )
                     nets_torch.append(net)

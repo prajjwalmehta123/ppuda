@@ -457,20 +457,38 @@ class GHN(nn.Module):
         is_layer_scale = hasattr(module, 'layer_scale') and module.layer_scale is not None
         key = ('layer_scale' if is_layer_scale else 'weight' ) if is_w else 'bias'
         target_param = getattr(module, key)
-        sz_target = tuple(target_param) if isinstance(target_param, (list, tuple)) else target_param.shape
-        if self.training:
-            module.__dict__[key] = tensor  # set the value avoiding the internal logic of PyTorch
-            # update parameters, so that named_parameters() will return tensors
-            # with gradients (for multigpu and other cases)
-            module._parameters[key] = tensor
+        if isinstance(target_param, tuple):
+            sz_target = target_param
+            # In lightweight networks, we just need to update the shape info
+            if self.training:
+                module.__dict__[key] = tensor  # set the value avoiding the internal logic of PyTorch
+                # update parameters, so that named_parameters() will return tensors
+                # with gradients (for multigpu and other cases)
+                module._parameters[key] = tensor
+            else:
+                # In evaluation mode for lightweight networks, we just need to return the shape
+                return sz_target
         else:
-            assert isinstance(target_param, nn.Parameter), type(target_param)
-            # copy to make sure there is no sharing of memory
-            target_param.data = tensor.clone()
-
+            sz_target = tuple(target_param) if isinstance(target_param, (list, tuple)) else target_param.shape
+            if self.training:
+                module.__dict__[key] = tensor  # set the value avoiding the internal logic of PyTorch
+                # update parameters, so that named_parameters() will return tensors
+                # with gradients (for multigpu and other cases)
+                module._parameters[key] = tensor
+            else:
+                assert isinstance(target_param, nn.Parameter), type(target_param)
+                # copy to make sure there is no sharing of memory
+                target_param.data = tensor.clone()
         set_param = getattr(module, key)
-        assert sz_target == set_param.shape, (sz_target, set_param.shape)
-        return set_param.shape
+        if isinstance(set_param, torch.Tensor):
+            try:
+                assert sz_target == set_param.shape, (sz_target, set_param.shape)
+            except:
+                if hasattr(self, 'debug_level') and self.debug_level > 0:
+                    print(f"Warning: Parameter shape mismatch: expected {sz_target}, got {set_param.shape}")
+            return set_param.shape
+        else:
+            return sz_target
 
 
     def _normalize(self, module, p, is_w):

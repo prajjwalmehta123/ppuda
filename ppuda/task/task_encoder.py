@@ -36,9 +36,12 @@ class TaskEncoder(nn.Module):
         """Extract features and create task embedding from support set."""
         # Extract per-image features
         if isinstance(support_data, tuple) and len(support_data) == 2:
-            support_images, support_labels = support_data
+            if isinstance(support_data[0], tuple):
+                (support_images,_), support_labels = support_data
+            else:
+                support_images, support_labels = support_data
         else:
-            raise ValueError("support_data must be a tuple of (images, labels)")
+            raise ValueError('Support data must be of type tuple')
         features = self.backbone(support_images)
 
         # Compute class prototypes

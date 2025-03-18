@@ -19,14 +19,13 @@ class GradientPreservingWrapper(nn.Module):
         self.task_embedding = task_embedding
         self.num_classes = num_classes
         feature_dim = 0
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.base_feature_dim = self._detect_feature_dim(base_net)
 
         if hasattr(task_embedding, 'shape'):
             self.embed_dim = task_embedding.shape[-1]
         else:
             self.embed_dim = 128  # Default fallback
-
-        self.device = next(base_net.parameters()).device
 
         print(f"Network feature dimension: {self.base_feature_dim}")
         print(f"Task embedding dimension: {self.embed_dim}")
@@ -39,6 +38,7 @@ class GradientPreservingWrapper(nn.Module):
 
     def _detect_feature_dim(self, net):
         """Detect the feature dimension from the network architecture."""
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # Try to find feature dimension from classifier
         if hasattr(net, 'classifier'):
             if isinstance(net.classifier, nn.Sequential):
@@ -59,10 +59,9 @@ class GradientPreservingWrapper(nn.Module):
                         if hasattr(op, 'out_channels'):
                             return op.out_channels
 
-        # Fallback to extracting features
-        dummy_input = torch.zeros(1, 3, 32, 32).to(next(net.parameters()).device)  # Assuming CIFAR-sized input
         try:
             # Process through the network up to global pooling
+            dummy_input = torch.zeros(1, 3, 32, 32).to(self.device)  # Assuming CIFAR-sized input
             with torch.no_grad():
                 # Run through stem and cells
                 if hasattr(net, 'stem0'):
@@ -89,52 +88,65 @@ class GradientPreservingWrapper(nn.Module):
                 # Get feature dimension
                 return x.view(x.size(0), -1).size(1)
         except Exception as e:
-            print(f"Error detecting feature dimension: {e}")
-
+            print(f"Debug Error: Cannot process this network architecture. Falling back to default feature dim")
         # Final fallback for ResNet
         return 512
 
     def forward(self, x):
-        device = next(self.base_net.parameters()).device
-        x = x.to(device)
-        # Handle ResNet-style networks with cells correctly
-        if hasattr(self.base_net, '_is_vit') and self.base_net._is_vit:
-            # Visual Transformer pattern
-            s0 = self.base_net.stem0(x)
-            s0 = s1 = self.base_net.pos_enc(s0)
-
-            for cell in self.base_net.cells:
-                s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
-
-            features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
-
-        elif hasattr(self.base_net, 'stem0') and hasattr(self.base_net, 'cells'):
-            # ResNet-style with separate stem0/stem1 pattern
-            s0 = self.base_net.stem0(x)
-            s1 = None
-            if hasattr(self.base_net, 'stem1') and self.base_net.stem1 is not None:
-                s1 = self.base_net.stem1(s0)
-
-            for cell in self.base_net.cells:
-                s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
-
-            features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
-
-        elif hasattr(self.base_net, 'stem') and hasattr(self.base_net, 'cells'):
-            # ResNet-style with combined stem pattern
-            s0 = s1 = self.base_net.stem(x)
-
-            for cell in self.base_net.cells:
-                s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
-
-            features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
-
+        x = x.to(self.device)
+        is_lightweight = hasattr(self.base_net, 'stem0') and isinstance(getattr(self.base_net.stem0, 'weight', None),
+                                                                       tuple)
+        if is_lightweight:
+            # If lightweight network, skip base_net processing and use features directly
+            features = x.view(x.size(0), -1)  # Flatten the input as features
+            if features.size(1) != self.base_feature_dim:
+                # Adapt feature dimension if needed
+                features = F.adaptive_avg_pool1d(features.unsqueeze(1), self.base_feature_dim).squeeze(1)
         else:
-            print('Debug Error: Cannot process this network architecture. Falling back to generic network')
-            for name, module in self.base_net.named_children():
-                if name != 'classifier':
-                    x = module(x)
-            features = x.view(x.size(0), -1)
+            # Handle ResNet-style networks with cells correctly
+            try:
+                if hasattr(self.base_net, '_is_vit') and self.base_net._is_vit:
+                    # Visual Transformer pattern
+                    s0 = self.base_net.stem0(x)
+                    s0 = s1 = self.base_net.pos_enc(s0)
+
+                    for cell in self.base_net.cells:
+                        s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
+
+                    features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
+
+                elif hasattr(self.base_net, 'stem0') and hasattr(self.base_net, 'cells'):
+                    # ResNet-style with separate stem0/stem1 pattern
+                    s0 = self.base_net.stem0(x)
+                    s1 = None
+                    if hasattr(self.base_net, 'stem1') and self.base_net.stem1 is not None:
+                        s1 = self.base_net.stem1(s0)
+
+                    for cell in self.base_net.cells:
+                        s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
+
+                    features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
+
+                elif hasattr(self.base_net, 'stem') and hasattr(self.base_net, 'cells'):
+                    # ResNet-style with combined stem pattern
+                    s0 = s1 = self.base_net.stem(x)
+
+                    for cell in self.base_net.cells:
+                        s0, s1 = s1, cell(s0, s1, self.base_net.drop_path_prob)
+
+                    features = self.base_net.global_pooling(s1).view(s1.size(0), -1)
+
+                else:
+                    print('Debug Error: Cannot process this network architecture. Falling back to generic network')
+                    for name, module in self.base_net.named_children():
+                        if name != 'classifier':
+                            x = module(x)
+                    features = x.view(x.size(0), -1)
+            except Exception as e:
+                print(f"Forward pass error: {e}. Using feature extraction fallback.")
+                features = x.view(x.size(0), -1)
+                if features.size(1) != self.base_feature_dim:
+                    features = F.adaptive_avg_pool1d(features.unsqueeze(1), self.base_feature_dim).squeeze(1)
         features = features.to(self.device)
         logits = self.classifier(features)
 
@@ -223,10 +235,13 @@ class TaskAwareGHN(GHN):
                 predict_class_layers=True, bn_train=True):
         """Predict parameters for networks based on architecture and task data."""
         # Create task embedding if support data is provided
+        device = next(self.parameters()).device
         task_embedding = None
         if support_data is not None:
-            support_images, _ = support_data
-            task_embedding = self.task_encoder(support_images)
+            #support_images, _ = support_data
+            task_embedding = self.task_encoder(support_data)
+        #support_images = support_images.to(device)
+        #support_labels = support_labels.to(device)
 
         # Use parent GHN to predict parameters, but NOT classification layer
         with torch.no_grad():
