@@ -377,14 +377,16 @@ class GHN(nn.Module):
                         if cell_id < len(target_modules) and param_name in target_modules[cell_id]:
                             del target_modules[cell_id][param_name]
 
-                # Prune redundant ops in Network by setting their params to None
-                for c_id, modules in enumerate(target_modules):
-                    if isinstance(modules, dict):
-                        for m in target_modules[cell_id].values():
-                            if m['is_w']:
-                                m['module'].weight = None
-                                if hasattr(m['module'], 'bias') and m['module'].bias is not None:
-                                    m['module'].bias = None
+                for cell_id in range(len(target_modules)):
+                    if cell_id < len(target_modules):
+                        if isinstance(target_modules[cell_id], dict):
+                            for m in target_modules[cell_id].values():
+                                if isinstance(m, dict) and 'is_w' in m and 'module' in m:
+                                    if m['is_w']:
+                                        if hasattr(m['module'], 'weight'):
+                                            m['module'].weight = None
+                                        if hasattr(m['module'], 'bias') and m['module'].bias is not None:
+                                            m['module'].bias = None
 
         return mapping, params_map
 
