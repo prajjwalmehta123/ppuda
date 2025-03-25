@@ -117,21 +117,49 @@ def compute_meta_loss(model, task_support_images, task_support_labels,
 
     return total_loss, classification_loss.item(), compute_accuracy(query_logits, task_query_labels)
 
-def meta_training(model, train_dataset, train_sampler, networks, optimizer, device, args):
+def augment_support_set(support_images, support_labels, n_way, k_shot):
     """
-    Train with a variety of architectures to improve generalization.
+    """
+    if k_shot > 1:
+        return support_images, support_labels
 
-    Args:
-        model: TaskAwareGHN model
-        train_dataset: Training dataset
-        train_sampler: Task sampler
-        networks: List of different network architectures
-        optimizer: Optimizer
-        device: Device to use
-        args: Training arguments
+    # Define transformations for augmentation
+    augment_transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.5071, 0.4867, 0.4408],
+            std=[0.2675, 0.2565, 0.2761]
+        )
+    ])
 
-    Returns:
-        Tuple of (average loss, average accuracy)
+    # Create augmented versions
+    augmented_support = []
+    augmented_labels = []
+
+    # Process each example in the support set
+    for i in range(len(support_images)):
+        # Keep original
+        augmented_support.append(support_images[i])
+        augmented_labels.append(support_labels[i])
+
+        # Add 2-3 augmented versions for each example
+        aug_count = 3 if k_shot == 1 else 1
+        for _ in range(aug_count):
+            # Remove normalization then add it back after transformations
+            img = support_images[i].cpu()
+            aug_img = augment_transform(img)
+            augmented_support.append(aug_img.to(support_images.device))
+            augmented_labels.append(support_labels[i])
+
+    return torch.stack(augmented_support), torch.stack(augmented_labels)
+
+def meta_training(model, train_dataset, train_sampler, networks, optimizer,scheduler, device, args):
+    """
+    Enhanced training with improved inner loop optimization and support set augmentation.
     """
     model.train()
     train_losses = []
@@ -168,6 +196,11 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer, devi
             task_query_images = query_images[start_idx:end_idx]
             task_query_labels = query_labels[start_idx:end_idx]
 
+            if args.k_shot == 1:
+                task_support_images, task_support_labels = augment_support_set(
+                    task_support_images, task_support_labels, args.n_way, args.k_shot
+                )
+
             # Sample a random network architecture
             network_idx = np.random.randint(len(networks))
             network = networks[network_idx].to(device)
@@ -175,20 +208,59 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer, devi
             # Use the simple architecture encoder for stability
             arch_embedding = model.encode_architecture_simple(network)
 
-            # Compute enhanced loss with auxiliary components
-            loss, _, acc = compute_meta_loss(
-                model, task_support_images, task_support_labels,
-                task_query_images, task_query_labels, arch_embedding
-            )
+            # Save original adaptation parameters for later restoration
+            adaptation_params = {}
+            for name, param in model.named_parameters():
+                if 'adapt_layer' in name or 'classifier' in name:
+                    adaptation_params[name] = param.data.clone()
 
-            batch_losses.append(loss)
+            # Inner loop adaptation - simulate fine-tuning
+            adaptation_steps = 5 if args.k_shot == 1 else 3
+
+            # Get task embedding
+            task_embedding = model.encode_task(task_support_images, task_support_labels)
+
+            temperature = 1.0
+            if args.k_shot == 1:
+                temperature = 0.8  # Lower temperature for more careful adaptation
+
+            # Inner loop optimization (simplified)
+            for _ in range(adaptation_steps):
+                # Forward pass on support set
+                support_logits = model(task_support_images, arch_embedding, task_embedding, temperature)
+                inner_loss = F.cross_entropy(support_logits, task_support_labels)
+
+                # Update adaptation parameters (manually without optimizer for speed)
+                inner_lr = 0.01
+                inner_loss.backward(retain_graph=True)
+
+                # Manually update adaptation layers
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if ('adapt_layer' in name or 'classifier' in name) and param.grad is not None:
+                            param.data = param.data - inner_lr * param.grad
+                            param.grad = None
+
+            # Evaluate on query set after adaptation
+            query_logits = model(task_query_images, arch_embedding, task_embedding, temperature)
+            outer_loss = F.cross_entropy(query_logits, task_query_labels)
+            batch_losses.append(outer_loss)
+
+            # Calculate accuracy
+            acc = compute_accuracy(query_logits, task_query_labels)
             batch_accs.append(acc)
+
+            # Restore original parameters for next task
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if name in adaptation_params:
+                        param.data = adaptation_params[name]
 
         # Average loss across tasks
         loss = torch.mean(torch.stack(batch_losses))
 
         # Apply gradient stabilization
-        success = train_with_gradient_stabilization(model, optimizer, loss, args)
+        success, grad_norms = train_with_gradient_stabilization(model, optimizer, loss, args)
 
         if success:
             train_losses.append(loss.item())
@@ -199,6 +271,8 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer, devi
                 'loss': f"{loss.item():.4f}",
                 'acc': f"{np.mean(batch_accs):.4f}"
             })
+            if scheduler is not None:
+                scheduler.step()
 
     return np.mean(train_losses), np.mean(train_accs)
 
@@ -388,7 +462,6 @@ def evaluate_cross_domain(model, test_dataset, test_sampler, networks, device, a
 
 
 def train_with_gradient_stabilization(model, optimizer, loss, args):
-    """Apply gradient stabilization techniques during backpropagation."""
     # Calculate gradient norm before clipping for monitoring
     optimizer.zero_grad()
     loss.backward()
@@ -412,13 +485,33 @@ def train_with_gradient_stabilization(model, optimizer, loss, args):
                     grad_norms[param_key] = 0
                 grad_norms[param_key] += param.grad.norm().item()
 
-        # Apply gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # Apply gradient clipping with adaptive threshold for 1-shot
+        clip_value = args.grad_clip
+        if args.k_shot == 1:
+            # More aggressive clipping for 1-shot to prevent overfitting
+            clip_value = args.grad_clip * 0.8
 
-        # Apply weight decay outside of optimizer
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+
+        # Separate clipping for different component groups for better stability
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if 'task_encoder' in name:
+                    torch.nn.utils.clip_grad_norm_([param], clip_value * 0.9)
+                elif 'arch_encoder' in name:
+                    torch.nn.utils.clip_grad_norm_([param], clip_value * 0.8)
+
+        # Apply weight decay outside of optimizer - with component-specific values
         for name, param in model.named_parameters():
             if param.grad is not None and 'bias' not in name and 'layer_norm' not in name:
-                param.grad.add_(param * args.wd)
+                # Use stronger regularization for classifier
+                decay_factor = args.wd
+                if 'classifier' in name:
+                    decay_factor = args.wd * 1.5
+                elif 'task_encoder' in name:
+                    decay_factor = args.wd * 1.2
+
+                param.grad.add_(param * decay_factor)
 
         # Step optimizer
         optimizer.step()
@@ -476,80 +569,33 @@ def adjust_network_for_cifar(network):
     return network
 
 
-def setup_progressive_training(model, epoch, total_epochs):
-    """Configure model for progressive training based on current epoch."""
+def setup_progressive_training(model, epoch, total_epochs, k_shot):
+    """Configure model for progressive training with 1-shot specific handling."""
+    # Adapt phase boundaries based on shot count
+    phase1_end = total_epochs // 3 if k_shot > 1 else total_epochs // 4
+    phase2_end = 2 * total_epochs // 3 if k_shot > 1 else 3 * total_epochs // 5
+
     phase = 1
-    if epoch < total_epochs // 3:
+    if epoch < phase1_end:
         # Phase 1: Train only task encoder and classifier
         phase = 1
-        for name, param in model.named_parameters():  # Changed from model.parameters()
+        for name, param in model.named_parameters():
             param.requires_grad = 'task_encoder' in name or 'classifier' in name
-    elif epoch < 2 * total_epochs // 3:
+    elif epoch < phase2_end:
         # Phase 2: Add parameter generator
         phase = 2
-        for name, param in model.named_parameters():  # Changed from model.parameters()
+        for name, param in model.named_parameters():
             param.requires_grad = True
+            # Freeze backbone for 1-shot to prevent overfitting
+            if k_shot == 1 and 'backbone' in name and 'layer4' not in name:
+                param.requires_grad = False
     else:
         # Phase 3: Train everything
         phase = 3
-        for name, param in model.named_parameters():  # Changed from model.parameters()
+        for name, param in model.named_parameters():
             param.requires_grad = True
+
     return phase
-
-
-def initialize_monitoring(args):
-    """Initialize monitoring tools for tracking training progress."""
-    monitoring = {
-        'train_losses': [],
-        'train_accs': [],
-        'val_losses': [],
-        'val_accs': [],
-        'grad_norms': [],
-        'lr_history': [],
-        'phase_history': [],
-        'best_val_acc': 0.0,
-        'best_epoch': 0,
-        'current_epoch': 0
-    }
-
-    # Create a log directory for this run
-    log_dir = os.path.join(args.save, 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-
-    # Create a log file
-    log_file = os.path.join(log_dir, 'training_log.txt')
-    with open(log_file, 'w') as f:
-        f.write(f"Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Args: {args}\n\n")
-
-    monitoring['log_file'] = log_file
-
-    return monitoring
-
-def log_training_stats(monitoring, epoch, train_loss, train_acc, val_loss, val_acc, phase, lr):
-    """Log training statistics to file and update monitoring."""
-    monitoring['current_epoch'] = epoch
-    monitoring['train_losses'].append(train_loss)
-    monitoring['train_accs'].append(train_acc)
-    monitoring['val_losses'].append(val_loss)
-    monitoring['val_accs'].append(val_acc)
-    monitoring['phase_history'].append(phase)
-    monitoring['lr_history'].append(lr)
-
-    # Update best model info
-    if val_acc > monitoring['best_val_acc']:
-        monitoring['best_val_acc'] = val_acc
-        monitoring['best_epoch'] = epoch
-
-    # Log to file
-    with open(monitoring['log_file'], 'a') as f:
-        f.write(f"\nEpoch {epoch} (Phase {phase}) - LR: {lr:.6f}\n")
-        f.write(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}\n")
-        f.write(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}\n")
-        if val_acc == monitoring['best_val_acc']:
-            f.write(f"New best model with validation accuracy {val_acc:.4f}\n")
-
-    return monitoring
 
 
 def main():
@@ -727,11 +773,11 @@ def main():
     # Training loop
     best_val_acc = 0.0
     for epoch in range(args.epochs):
-        phase = setup_progressive_training(model, epoch, args.epochs)
+        phase = setup_progressive_training(model, epoch, args.epochs,args.k_shot)
         print(f"\nEpoch {epoch + 1}/{args.epochs} - Phase {phase} - LR: {scheduler.get_last_lr()[0]:.6f}")
 
         # Training with architecture variety
-        train_loss, train_acc = meta_training(model, train_dataset, train_sampler, networks, optimizer, device, args)
+        train_loss, train_acc = meta_training(model, train_dataset, train_sampler, networks, optimizer,scheduler, device, args)
         print(f"Training - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
 
         # Validation
@@ -750,19 +796,6 @@ def main():
                 "val/accuracy": val_acc,
                 "learning_rate": scheduler.get_last_lr()[0]
             })
-
-        # Save checkpoint
-        checkpoint_path = os.path.join(args.save, f"model_epoch_{epoch + 1}.pt")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': train_loss,
-            'train_acc': train_acc,
-            'val_loss': val_loss,
-            'val_acc': val_acc
-        }, checkpoint_path)
-        print(f"Saved checkpoint to {checkpoint_path}")
 
         # Save best model
         if val_acc > best_val_acc:

@@ -84,7 +84,7 @@ class TaskAwareGHN(nn.Module):
         self.arch_embedding_cache = {}
         self.simple_projection = nn.Linear(9, self.arch_embed_dim).to(device)
         nn.init.orthogonal_(self.simple_projection.weight)
-        self = self.to(device)
+        self.to(device)
 
     def encode_architecture_simple(self, network):
         """
@@ -206,9 +206,29 @@ class TaskAwareGHN(nn.Module):
         Returns:
             Task embedding tensor
         """
-        features, _, _, _, _ = self.extract_multi_scale_features(support_images)
+        # Extract multi-scale features
+        features, f1, f2, f3, f4 = self.extract_multi_scale_features(support_images)
 
-        # Compute class prototypes
+        # Get the actual feature dimension
+        actual_feature_dim = features.shape[1]
+
+        #print(f"Feature shape: {features.shape}, Expected: {self.multi_scale_dim}")
+
+        # Check if task_encoder was initialized with the correct dimensions
+        if not hasattr(self, "_dimension_fixed") and actual_feature_dim != self.multi_scale_dim:
+            print(f"Fixing dimension mismatch: {actual_feature_dim} vs {self.multi_scale_dim}")
+            # Recreate task encoder with correct dimensions
+            self.multi_scale_dim = actual_feature_dim
+            self.task_encoder = nn.Sequential(
+                nn.Linear(self.multi_scale_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.hidden_dim, self.task_embed_dim)
+            ).to(self.device)
+            self._dimension_fixed = True
+
+        # Compute class prototypes - enhanced for 1-shot
         prototypes = []
         for c in range(self.num_classes):
             class_mask = (support_labels == c)
@@ -222,7 +242,7 @@ class TaskAwareGHN(nn.Module):
 
         return self.task_encoder(task_features)
 
-    def set_adaptation_params(self, arch_embedding, task_embedding):
+    def set_adaptation_params(self, arch_embedding, task_embedding, temperature=1.0):
         """
         Use parameter generator to predict parameters for all adaptation modules.
 
@@ -235,6 +255,13 @@ class TaskAwareGHN(nn.Module):
         params_layer2 = self.param_generator(arch_embedding, task_embedding, 128)
         params_layer3 = self.param_generator(arch_embedding, task_embedding, 256)
         params_layer4 = self.param_generator(arch_embedding, task_embedding, 512)
+
+        if temperature != 1.0:
+            for params in [params_layer1, params_layer2, params_layer3, params_layer4]:
+                for k, v in params.items():
+                    if 'weight' in k:
+                        # Scale weights to control adaptation strength
+                        params[k] = v * temperature
 
         # Set parameters for adaptation modules
         self._set_module_params(self.adapt_layer1, params_layer1)
@@ -268,7 +295,7 @@ class TaskAwareGHN(nn.Module):
             # Set the parameter
             setattr(target_module, param_name, nn.Parameter(param))
 
-    def forward(self, query_images, arch_embedding=None, task_embedding=None):
+    def forward(self, query_images, arch_embedding=None, task_embedding=None,temperature=1.0):
         """
         Process query images with task-specific and architecture-aware adaptation.
 
@@ -282,7 +309,7 @@ class TaskAwareGHN(nn.Module):
         """
         if arch_embedding is not None and task_embedding is not None:
             # Use arch and task embeddings to predict adaptation module parameters
-            self.set_adaptation_params(arch_embedding, task_embedding)
+            self.set_adaptation_params(arch_embedding, task_embedding,temperature)
 
         # Apply backbone with adaptation modules
         # First part of ResNet
