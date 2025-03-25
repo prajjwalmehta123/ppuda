@@ -168,6 +168,9 @@ class TaskAwareGHN(nn.Module):
         Returns:
             Multi-scale features tensor
         """
+        if support_images.device != self.backbone.conv1.weight.device:
+            # Force the backbone to the right device
+            self.backbone = self.backbone.to(support_images.device)
         # Forward pass through initial layers
         x = self.backbone.conv1(support_images)
         x = self.backbone.bn1(x)
