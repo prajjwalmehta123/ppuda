@@ -1,11 +1,10 @@
 """
 Train a Hybrid GHN-based Meta-Learning model for few-shot learning.
-
-Example:
-    python train_ta_ghn.py
 """
 import argparse
 import os
+from datetime import time
+
 import torch
 import numpy as np
 import torch.nn as nn
@@ -17,6 +16,7 @@ from tqdm import tqdm
 import torchvision.models as models
 import wandb
 
+from ppuda.deepnets1m.architecture import robust_network_adaptation
 from ppuda.ghn.task_aware_ghn import TaskAwareGHN
 from ppuda.task.task_sampler import TaskSampler, ClassSubset
 
@@ -97,7 +97,27 @@ def compute_accuracy(logits, targets):
     correct = (preds == targets).float().sum()
     return correct.item() / targets.size(0)
 
-def train_with_architecture_variety(model, train_dataset, train_sampler, networks, optimizer, device, args):
+
+def compute_meta_loss(model, task_support_images, task_support_labels,
+                      task_query_images, task_query_labels, arch_embedding):
+    """Compute loss with auxiliary components."""
+    # Get task embedding
+    task_embedding = model.encode_task(task_support_images, task_support_labels)
+
+    # Main classification loss
+    query_logits = model(task_query_images, arch_embedding, task_embedding)
+    classification_loss = F.cross_entropy(query_logits, task_query_labels)
+
+    # Add auxiliary classification loss on support set
+    support_logits = model(task_support_images, arch_embedding, task_embedding)
+    support_loss = F.cross_entropy(support_logits, task_support_labels)
+
+    # Total loss (weighted combination)
+    total_loss = classification_loss + 0.3 * support_loss
+
+    return total_loss, classification_loss.item(), compute_accuracy(query_logits, task_query_labels)
+
+def meta_training(model, train_dataset, train_sampler, networks, optimizer, device, args):
     """
     Train with a variety of architectures to improve generalization.
 
@@ -132,7 +152,7 @@ def train_with_architecture_variety(model, train_dataset, train_sampler, network
         # Forward pass and compute loss
         optimizer.zero_grad()
 
-        # For each task, use a different architecture
+        # Batch losses and accs
         batch_losses = []
         batch_accs = []
 
@@ -152,25 +172,14 @@ def train_with_architecture_variety(model, train_dataset, train_sampler, network
             network_idx = np.random.randint(len(networks))
             network = networks[network_idx].to(device)
 
-            # Encode architecture
+            # Use the simple architecture encoder for stability
             arch_embedding = model.encode_architecture_simple(network)
 
-            # Set the current architecture as the backbone temporarily
-            original_backbone = model.backbone
-            model.backbone = network
-
-            # Encode task from support set
-            task_embedding = model.encode_task(task_support_images, task_support_labels)
-
-            # Restore original backbone
-            model.backbone = original_backbone
-
-            # Get predictions on query set
-            query_logits = model(task_query_images, arch_embedding, task_embedding)
-            loss = F.cross_entropy(query_logits, task_query_labels)
-
-            # Calculate accuracy
-            acc = compute_accuracy(query_logits, task_query_labels)
+            # Compute enhanced loss with auxiliary components
+            loss, _, acc = compute_meta_loss(
+                model, task_support_images, task_support_labels,
+                task_query_images, task_query_labels, arch_embedding
+            )
 
             batch_losses.append(loss)
             batch_accs.append(acc)
@@ -178,23 +187,18 @@ def train_with_architecture_variety(model, train_dataset, train_sampler, network
         # Average loss across tasks
         loss = torch.mean(torch.stack(batch_losses))
 
-        # Backward pass
-        loss.backward()
+        # Apply gradient stabilization
+        success = train_with_gradient_stabilization(model, optimizer, loss, args)
 
-        # Gradient clipping
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if success:
+            train_losses.append(loss.item())
+            train_accs.append(np.mean(batch_accs))
 
-        optimizer.step()
-
-        train_losses.append(loss.item())
-        train_accs.append(np.mean(batch_accs))
-
-        # Update tqdm progress bar
-        train_iter.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'acc': f"{np.mean(batch_accs):.4f}"
-        })
+            # Update tqdm progress bar
+            train_iter.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{np.mean(batch_accs):.4f}"
+            })
 
     return np.mean(train_losses), np.mean(train_accs)
 
@@ -247,17 +251,13 @@ def evaluate_arch_aware(model, val_dataset, val_sampler, device, args):
                 # Encode architecture
                 arch_embedding = model.encode_architecture_simple(model.backbone)
 
-                # Encode task from support set
-                task_embedding = model.encode_task(task_support_images, task_support_labels)
+                # Compute loss and accuracy
+                _, loss, acc = compute_meta_loss(
+                    model, task_support_images, task_support_labels,
+                    task_query_images, task_query_labels, arch_embedding
+                )
 
-                # Get predictions on query set
-                query_logits = model(task_query_images, arch_embedding, task_embedding)
-                loss = F.cross_entropy(query_logits, task_query_labels)
-
-                # Calculate accuracy
-                acc = compute_accuracy(query_logits, task_query_labels)
-
-                batch_losses.append(loss.item())
+                batch_losses.append(loss)
                 batch_accs.append(acc)
 
             val_loss_step = np.mean(batch_losses)
@@ -274,33 +274,35 @@ def evaluate_arch_aware(model, val_dataset, val_sampler, device, args):
     return np.mean(val_losses), np.mean(val_accs)
 
 def create_network_family():
-    """
-    Create a family of different network architectures for training.
-    """
+    """Create a diverse family of networks adapted for CIFAR-100."""
     networks = []
 
-    # ResNet variants
-    networks.append(models.resnet18(pretrained=True))
-    networks.append(models.resnet34(pretrained=True))
+    # ResNet variants with different depths
+    resnet18 = robust_network_adaptation(models.resnet18(pretrained=True))
+    networks.append(resnet18)
+
+    resnet34 = robust_network_adaptation(models.resnet34(pretrained=True))
+    networks.append(resnet34)
+
+    # Create a mini resnet with fewer parameters
+    mini_resnet = robust_network_adaptation(models.resnet18(pretrained=True))
+    mini_resnet.layer4 = nn.Identity()  # Remove last layer
+    networks.append(mini_resnet)
 
     # DenseNet variant
-    networks.append(models.densenet121(pretrained=True))
+    densenet = robust_network_adaptation(models.densenet121(pretrained=True))
+    networks.append(densenet)
 
     # MobileNet variant
-    networks.append(models.mobilenet_v2(pretrained=True))
+    mobilenet = robust_network_adaptation(models.mobilenet_v2(pretrained=True))
+    networks.append(mobilenet)
 
-    # Ensure all networks have proper output handling
-    for net in networks:
-        if hasattr(net, 'fc'):
-            net.fc = nn.Identity()
-        elif hasattr(net, 'classifier'):
-            if isinstance(net.classifier, nn.Sequential):
-                net.classifier[-1] = nn.Identity()
-            else:
-                net.classifier = nn.Identity()
+    # Add a shallower version of mobilenet
+    shallow_mobilenet = robust_network_adaptation(models.mobilenet_v2(pretrained=True))
+    shallow_mobilenet.features = nn.Sequential(*list(shallow_mobilenet.features)[:10])
+    networks.append(shallow_mobilenet)
 
     return networks
-
 
 def evaluate_cross_domain(model, test_dataset, test_sampler, networks, device, args):
     """
@@ -383,6 +385,172 @@ def evaluate_cross_domain(model, test_dataset, test_sampler, networks, device, a
         print(
             f"Results with {net_name}: Loss = {results[net_name]['loss']:.4f}, Accuracy = {results[net_name]['accuracy']:.4f}")
     return results
+
+
+def train_with_gradient_stabilization(model, optimizer, loss, args):
+    """Apply gradient stabilization techniques during backpropagation."""
+    # Calculate gradient norm before clipping for monitoring
+    optimizer.zero_grad()
+    loss.backward()
+
+    # Check for NaN or Inf gradients
+    valid_gradients = True
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                valid_gradients = False
+                print(f"Warning: NaN or Inf gradients in {name}")
+                break
+
+    if valid_gradients:
+        # Calculate gradient norm by parameter group for monitoring
+        grad_norms = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                param_key = name.split('.')[0]  # Group by top-level module
+                if param_key not in grad_norms:
+                    grad_norms[param_key] = 0
+                grad_norms[param_key] += param.grad.norm().item()
+
+        # Apply gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+        # Apply weight decay outside of optimizer
+        for name, param in model.named_parameters():
+            if param.grad is not None and 'bias' not in name and 'layer_norm' not in name:
+                param.grad.add_(param * args.wd)
+
+        # Step optimizer
+        optimizer.step()
+
+        return True, grad_norms
+
+    # Skip this batch if gradients are invalid
+    print("Skipping batch due to invalid gradients")
+    optimizer.zero_grad()
+    return False, {}
+
+
+def adjust_network_for_cifar(network):
+    """Adapt ImageNet pretrained networks for CIFAR-100 images (32x32)"""
+    # Replace first convolutional layer with smaller kernel for ResNets
+    if hasattr(network, 'conv1'):
+        in_channels = network.conv1.in_channels
+        out_channels = network.conv1.out_channels
+        network.conv1 = nn.Conv2d(in_channels, out_channels,
+                                  kernel_size=3, stride=1,
+                                  padding=1, bias=False)
+
+    # Remove maxpool which reduces spatial dimensions too much for CIFAR images
+    if hasattr(network, 'maxpool'):
+        network.maxpool = nn.Identity()
+
+    # For DenseNet
+    if hasattr(network, 'features') and isinstance(network.features[0], nn.Conv2d):
+        # Replace first conv
+        in_channels = network.features[0].in_channels
+        out_channels = network.features[0].out_channels
+        network.features[0] = nn.Conv2d(in_channels, out_channels,
+                                        kernel_size=3, stride=1,
+                                        padding=1, bias=False)
+        # Remove pooling if it exists
+        for i, module in enumerate(network.features):
+            if isinstance(module, nn.MaxPool2d):
+                network.features[i] = nn.Identity()
+                break
+
+    # For MobileNetV2
+    if hasattr(network, 'features'):
+        # MobileNetV2 has a different structure - need to handle it separately
+        # Find the first Conv2d layer in the features
+        for i, module in enumerate(network.features):
+            if hasattr(module, 'conv') and hasattr(module.conv, 'stride'):
+                # For InvertedResidual blocks
+                module.conv.stride = (1, 1)
+                break
+            elif isinstance(module, nn.Conv2d) and module.stride == (2, 2):
+                # Direct Conv2d
+                network.features[i].stride = (1, 1)
+                break
+
+    return network
+
+
+def setup_progressive_training(model, epoch, total_epochs):
+    """Configure model for progressive training based on current epoch."""
+    phase = 1
+    if epoch < total_epochs // 3:
+        # Phase 1: Train only task encoder and classifier
+        phase = 1
+        for name, param in model.named_parameters():  # Changed from model.parameters()
+            param.requires_grad = 'task_encoder' in name or 'classifier' in name
+    elif epoch < 2 * total_epochs // 3:
+        # Phase 2: Add parameter generator
+        phase = 2
+        for name, param in model.named_parameters():  # Changed from model.parameters()
+            param.requires_grad = True
+    else:
+        # Phase 3: Train everything
+        phase = 3
+        for name, param in model.named_parameters():  # Changed from model.parameters()
+            param.requires_grad = True
+    return phase
+
+
+def initialize_monitoring(args):
+    """Initialize monitoring tools for tracking training progress."""
+    monitoring = {
+        'train_losses': [],
+        'train_accs': [],
+        'val_losses': [],
+        'val_accs': [],
+        'grad_norms': [],
+        'lr_history': [],
+        'phase_history': [],
+        'best_val_acc': 0.0,
+        'best_epoch': 0,
+        'current_epoch': 0
+    }
+
+    # Create a log directory for this run
+    log_dir = os.path.join(args.save, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Create a log file
+    log_file = os.path.join(log_dir, 'training_log.txt')
+    with open(log_file, 'w') as f:
+        f.write(f"Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Args: {args}\n\n")
+
+    monitoring['log_file'] = log_file
+
+    return monitoring
+
+def log_training_stats(monitoring, epoch, train_loss, train_acc, val_loss, val_acc, phase, lr):
+    """Log training statistics to file and update monitoring."""
+    monitoring['current_epoch'] = epoch
+    monitoring['train_losses'].append(train_loss)
+    monitoring['train_accs'].append(train_acc)
+    monitoring['val_losses'].append(val_loss)
+    monitoring['val_accs'].append(val_acc)
+    monitoring['phase_history'].append(phase)
+    monitoring['lr_history'].append(lr)
+
+    # Update best model info
+    if val_acc > monitoring['best_val_acc']:
+        monitoring['best_val_acc'] = val_acc
+        monitoring['best_epoch'] = epoch
+
+    # Log to file
+    with open(monitoring['log_file'], 'a') as f:
+        f.write(f"\nEpoch {epoch} (Phase {phase}) - LR: {lr:.6f}\n")
+        f.write(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}\n")
+        f.write(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}\n")
+        if val_acc == monitoring['best_val_acc']:
+            f.write(f"New best model with validation accuracy {val_acc:.4f}\n")
+
+    return monitoring
+
 
 def main():
     """Main training function for architecture-aware GHN."""
@@ -521,31 +689,36 @@ def main():
         ve_cutoff=args.ve_cutoff
     ).to(device)
 
+    model.backbone = robust_network_adaptation(model.backbone)
+
     # Pre-cache architecture embeddings for all networks
     for network in [model.backbone] + networks:
         with torch.no_grad():
             _ = model.encode_architecture_simple(network)
 
     # Create optimizer
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
-        weight_decay=args.wd
+        weight_decay=args.wd,
+        betas=(0.9, 0.999)
     )
-
     # Create scheduler
     if args.scheduler == 'cosine':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            T_max=args.epochs
+            max_lr=args.lr,
+            total_steps=args.epochs * args.steps_per_epoch,
+            pct_start=0.1,
+            div_factor=25,
+            final_div_factor=1000
         )
     else:
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer,
-            milestones=[args.epochs // 3, args.epochs * 2 // 3],
-            gamma=0.1
+            milestones=[args.epochs // 5, args.epochs * 2 // 5, args.epochs * 3 // 5, args.epochs * 4 // 5],
+            gamma=0.5
         )
-
     # Print training info
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Training Architecture-Aware GHN with {num_trainable_params} trainable parameters!")
@@ -554,12 +727,11 @@ def main():
     # Training loop
     best_val_acc = 0.0
     for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs} - LR: {scheduler.get_last_lr()[0]:.6f}")
+        phase = setup_progressive_training(model, epoch, args.epochs)
+        print(f"\nEpoch {epoch + 1}/{args.epochs} - Phase {phase} - LR: {scheduler.get_last_lr()[0]:.6f}")
 
         # Training with architecture variety
-        train_loss, train_acc = train_with_architecture_variety(
-            model, train_dataset, train_sampler, networks, optimizer, device, args
-        )
+        train_loss, train_acc = meta_training(model, train_dataset, train_sampler, networks, optimizer, device, args)
         print(f"Training - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
 
         # Validation
@@ -611,8 +783,6 @@ def main():
                 wandb.run.summary["best_val_accuracy"] = best_val_acc
                 wandb.run.summary["best_epoch"] = epoch + 1
 
-        # Update scheduler
-        scheduler.step()
 
     print("Training completed!")
     print(f"Best validation accuracy: {best_val_acc:.4f}")
