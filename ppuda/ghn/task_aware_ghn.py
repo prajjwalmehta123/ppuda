@@ -68,10 +68,10 @@ class TaskAwareGHN(nn.Module):
         ).to(device)
 
         # Adaptation modules (parameters will be predicted by GHN)
-        self.layer1_proj = nn.Conv2d(64, 128, kernel_size=1)
-        self.layer2_proj = nn.Conv2d(128, 128, kernel_size=1)
-        self.layer3_proj = nn.Conv2d(256, 128, kernel_size=1)
-        self.layer4_proj = nn.Conv2d(512, 128, kernel_size=1)
+        self.layer1_proj = nn.Conv2d(64, 128, kernel_size=1).to(device)
+        self.layer2_proj = nn.Conv2d(128, 128, kernel_size=1).to(device)
+        self.layer3_proj = nn.Conv2d(256, 128, kernel_size=1).to(device)
+        self.layer4_proj = nn.Conv2d(512, 128, kernel_size=1).to(device)
 
         self.adapt_layer1 = AdaptationModule(64).to(device)
         self.adapt_layer2 = AdaptationModule(128).to(device)
@@ -84,6 +84,7 @@ class TaskAwareGHN(nn.Module):
         self.arch_embedding_cache = {}
         self.simple_projection = nn.Linear(9, self.arch_embed_dim).to(device)
         nn.init.orthogonal_(self.simple_projection.weight)
+        self = self.to(device)
 
     def encode_architecture_simple(self, network):
         """
