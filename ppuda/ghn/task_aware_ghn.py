@@ -73,10 +73,10 @@ class TaskAwareGHN(nn.Module):
         self.layer3_proj = nn.Conv2d(256, 128, kernel_size=1).to(device)
         self.layer4_proj = nn.Conv2d(512, 128, kernel_size=1).to(device)
 
-        self.adapt_layer1 = AdaptationModule(64).to(device)
-        self.adapt_layer2 = AdaptationModule(128).to(device)
-        self.adapt_layer3 = AdaptationModule(256).to(device)
-        self.adapt_layer4 = AdaptationModule(512).to(device)
+        self.adapt_layer1 = AdaptationModule(64, arch_embed_dim=arch_embed_dim).to(device)
+        self.adapt_layer2 = AdaptationModule(128, arch_embed_dim=arch_embed_dim).to(device)
+        self.adapt_layer3 = AdaptationModule(256, arch_embed_dim=arch_embed_dim).to(device)
+        self.adapt_layer4 = AdaptationModule(512, arch_embed_dim=arch_embed_dim).to(device)
         # Final classification layer
         self.classifier = nn.Linear(feature_dim, num_classes).to(device)
 
@@ -215,8 +215,6 @@ class TaskAwareGHN(nn.Module):
         # Get the actual feature dimension
         actual_feature_dim = features.shape[1]
 
-        #print(f"Feature shape: {features.shape}, Expected: {self.multi_scale_dim}")
-
         # Check if task_encoder was initialized with the correct dimensions
         if not hasattr(self, "_dimension_fixed") and actual_feature_dim != self.multi_scale_dim:
             print(f"Fixing dimension mismatch: {actual_feature_dim} vs {self.multi_scale_dim}")
@@ -241,9 +239,38 @@ class TaskAwareGHN(nn.Module):
             else:
                 prototypes.append(torch.zeros_like(features[0]))
 
-        task_features = torch.stack(prototypes).mean(0)
+        proto_tensor = torch.stack(prototypes)
+        relation_features = []
+        for i in range(len(prototypes)):
+            diffs = proto_tensor - proto_tensor[i].unsqueeze(0)
+            distances = torch.norm(diffs, dim=1)
+            relation_features.append(distances)
+        relation_tensor = torch.stack(relation_features).mean(0)
+        proto_mean = proto_tensor.mean(0)
+
+        relation_dim = self.num_classes
+        task_features = proto_mean.clone()
+        relation_scale = 0.3  # Hyperparameter to control influence
+        task_features[:relation_dim] = task_features[:relation_dim] * (
+                    1 - relation_scale) + relation_tensor * relation_scale
 
         return self.task_encoder(task_features)
+
+    def normalize_adaptation_params(self, temperature=0.8):
+        """Normalize adaptation parameters for better generalization"""
+        for module in [self.adapt_layer1, self.adapt_layer2,
+                       self.adapt_layer3, self.adapt_layer4]:
+            # Normalize weights with scaling factor
+            if hasattr(module, 'fc1') and hasattr(module.fc1, 'weight'):
+                norm = module.fc1.weight.norm()
+                if norm > 0:
+                    module.fc1.weight.data = module.fc1.weight.data * (1.0 / norm) * temperature
+
+            if hasattr(module, 'fc2') and hasattr(module.fc2, 'weight'):
+                norm = module.fc2.weight.norm()
+                if norm > 0:
+                    module.fc2.weight.data = module.fc2.weight.data * (1.0 / norm) * temperature
+
 
     def set_adaptation_params(self, arch_embedding, task_embedding, temperature=1.0):
         """
@@ -258,6 +285,7 @@ class TaskAwareGHN(nn.Module):
         params_layer2 = self.param_generator(arch_embedding, task_embedding, 128)
         params_layer3 = self.param_generator(arch_embedding, task_embedding, 256)
         params_layer4 = self.param_generator(arch_embedding, task_embedding, 512)
+        self.normalize_adaptation_params(temperature)
 
         if temperature != 1.0:
             for params in [params_layer1, params_layer2, params_layer3, params_layer4]:
@@ -323,19 +351,19 @@ class TaskAwareGHN(nn.Module):
 
         # Layer 1 with adaptation
         x = self.backbone.layer1(x)
-        x = self.adapt_layer1(x)
+        x = self.adapt_layer1(x,arch_embedding if arch_embedding is not None else None)
 
         # Layer 2 with adaptation
         x = self.backbone.layer2(x)
-        x = self.adapt_layer2(x)
+        x = self.adapt_layer2(x,arch_embedding if arch_embedding is not None else None)
 
         # Layer 3 with adaptation
         x = self.backbone.layer3(x)
-        x = self.adapt_layer3(x)
+        x = self.adapt_layer3(x,arch_embedding if arch_embedding is not None else None)
 
         # Layer 4 with adaptation
         x = self.backbone.layer4(x)
-        x = self.adapt_layer4(x)
+        x = self.adapt_layer4(x,arch_embedding if arch_embedding is not None else None)
 
         # Global pooling and classification
         x = F.adaptive_avg_pool2d(x, 1)
@@ -344,7 +372,7 @@ class TaskAwareGHN(nn.Module):
 
 
 class AdaptationModule(nn.Module):
-    def __init__(self, in_channels, reduction=4):
+    def __init__(self, in_channels, reduction=4,arch_embed_dim=128):
         super().__init__()
         self.in_channels = in_channels
         self.reduction = reduction
@@ -356,11 +384,17 @@ class AdaptationModule(nn.Module):
 
         # Spatial attention path
         self.conv_spatial = nn.Conv2d(2, 1, kernel_size=7, padding=3)
+        self.arch_projection = nn.Sequential(
+            nn.Linear(arch_embed_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, in_channels),
+        )
 
         # Layer normalization for better stability
         self.layer_norm = nn.LayerNorm(in_channels)
 
-    def forward(self, x, spatial_dims=None):
+    def forward(self, x, arch_embedding=None):
         # Original input for residual connection
         identity = x
 
@@ -373,6 +407,14 @@ class AdaptationModule(nn.Module):
         # Apply channel attention
         y_channel = F.relu(self.fc1(y_channel))
         y_channel = torch.sigmoid(self.fc2(y_channel))
+
+        if arch_embedding is not None:
+            # Project architecture embedding to scaling factors
+            arch_scale = torch.sigmoid(
+                self.arch_projection(arch_embedding)
+            ).view(1, -1, 1, 1)
+            scale_factors = 0.5 + 0.5 * arch_scale.squeeze(0).squeeze(-1).squeeze(-1)
+            y_channel = y_channel * scale_factors
 
         # Apply channel attention weights
         x_channel = x * y_channel.view(b, c, 1, 1)

@@ -14,6 +14,7 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 import torchvision.models as models
+from torch.cuda.amp import autocast, GradScaler
 import wandb
 
 from ppuda.deepnets1m.architecture import robust_network_adaptation
@@ -124,17 +125,19 @@ def augment_support_set(support_images, support_labels, n_way, k_shot):
         return support_images, support_labels
 
     # Define transformations for augmentation
-    augment_transform = transforms.Compose([
+    augment_transforms = [
         transforms.ToPILImage(),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomResizedCrop(32, scale=(0.8, 1.0)),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.5071, 0.4867, 0.4408],
             std=[0.2675, 0.2565, 0.2761]
         )
-    ])
+    ]
+    transform = transforms.Compose(augment_transforms)
 
     # Create augmented versions
     augmented_support = []
@@ -146,21 +149,17 @@ def augment_support_set(support_images, support_labels, n_way, k_shot):
         augmented_support.append(support_images[i])
         augmented_labels.append(support_labels[i])
 
-        # Add 2-3 augmented versions for each example
-        aug_count = 3 if k_shot == 1 else 1
-        for _ in range(aug_count):
-            # Remove normalization then add it back after transformations
-            img = support_images[i].cpu()
-            aug_img = augment_transform(img)
+        # Add 5 augmented versions
+        img = support_images[i].cpu()
+        for _ in range(5):
+            aug_img = transform(img)
             augmented_support.append(aug_img.to(support_images.device))
             augmented_labels.append(support_labels[i])
 
-    return torch.stack(augmented_support), torch.stack(augmented_labels)
-
+    return torch.stack(augmented_support), torch.tensor(augmented_labels,
+                                                        device=support_labels.device)
+"""
 def meta_training(model, train_dataset, train_sampler, networks, optimizer,scheduler, device, args):
-    """
-    Enhanced training with improved inner loop optimization and support set augmentation.
-    """
     model.train()
     train_losses = []
     train_accs = []
@@ -215,7 +214,7 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
                     adaptation_params[name] = param.data.clone()
 
             # Inner loop adaptation - simulate fine-tuning
-            adaptation_steps = 5 if args.k_shot == 1 else 3
+            adaptation_steps = 8 if args.k_shot == 1 else 3
 
             # Get task embedding
             task_embedding = model.encode_task(task_support_images, task_support_labels)
@@ -224,26 +223,45 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
             if args.k_shot == 1:
                 temperature = 0.8  # Lower temperature for more careful adaptation
 
+            inner_lr_initial = 0.005  # Lower starting LR
+            inner_lr_factor = 0.85  # Decay factor
+
             # Inner loop optimization (simplified)
-            for _ in range(adaptation_steps):
+            for ad_step in range(adaptation_steps):
+                inner_lr = inner_lr_initial * (inner_lr_factor ** ad_step)
                 # Forward pass on support set
                 support_logits = model(task_support_images, arch_embedding, task_embedding, temperature)
                 inner_loss = F.cross_entropy(support_logits, task_support_labels)
 
-                # Update adaptation parameters (manually without optimizer for speed)
-                inner_lr = 0.01
                 inner_loss.backward(retain_graph=True)
 
                 # Manually update adaptation layers
                 with torch.no_grad():
                     for name, param in model.named_parameters():
                         if ('adapt_layer' in name or 'classifier' in name) and param.grad is not None:
+                            grad_norm = param.grad.norm()
+                            if grad_norm > 2.0:
+                                param.grad = param.grad * (2.0 / grad_norm)
                             param.data = param.data - inner_lr * param.grad
                             param.grad = None
 
             # Evaluate on query set after adaptation
             query_logits = model(task_query_images, arch_embedding, task_embedding, temperature)
             outer_loss = F.cross_entropy(query_logits, task_query_labels)
+            if args.k_shot == 1:
+                query_features = model.extract_multi_scale_features(task_query_images)[0]
+                support_features = model.extract_multi_scale_features(task_support_images)[0]
+
+                query_features = F.normalize(query_features, dim=1)
+                support_features = F.normalize(support_features, dim=1)
+
+                domain_loss = F.mse_loss(
+                    query_features.mean(0),
+                    support_features.mean(0)
+                ) * 0.1  # Scale factor
+
+                # Add to outer loss
+                outer_loss = outer_loss + domain_loss
             batch_losses.append(outer_loss)
 
             # Calculate accuracy
@@ -274,6 +292,105 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
             if scheduler is not None:
                 scheduler.step()
 
+    return np.mean(train_losses), np.mean(train_accs)
+"""
+
+def meta_training(model, train_dataset, train_sampler, networks, optimizer, scheduler,scaler, device, args):
+    """Enhanced training with functional meta-learning approach"""
+    model.train()
+    train_losses = []
+    train_accs = []
+
+    train_iter = tqdm(range(args.steps_per_epoch), desc="Training")
+    for step in train_iter:
+        # Sample tasks
+        tasks = train_sampler.sample_batch(args.meta_batch_size)
+        support_images, support_labels, query_images, query_labels = collate_task_batch(tasks, train_dataset)
+
+        # Move data to device
+        support_images = support_images.to(device)
+        support_labels = support_labels.to(device)
+        query_images = query_images.to(device)
+        query_labels = query_labels.to(device)
+
+        # Initialize loss and optimizer
+        optimizer.zero_grad()
+        batch_losses = []
+        batch_accs = []
+
+        for i in range(args.meta_batch_size):
+            # Get task-specific data
+            start_idx = i * args.n_way * args.k_shot
+            end_idx = (i + 1) * args.n_way * args.k_shot
+            task_support_images = support_images[start_idx:end_idx]
+            task_support_labels = support_labels[start_idx:end_idx]
+
+            start_idx = i * args.n_way * args.query_size
+            end_idx = (i + 1) * args.n_way * args.query_size
+            task_query_images = query_images[start_idx:end_idx]
+            task_query_labels = query_labels[start_idx:end_idx]
+
+            # Apply augmentation for 1-shot learning
+            if args.k_shot == 1:
+                task_support_images, task_support_labels = augment_support_set(
+                    task_support_images, task_support_labels, args.n_way, args.k_shot
+                )
+
+            # Sample network and get embeddings
+            network_idx = np.random.randint(len(networks))
+            network = networks[network_idx].to(device)
+            arch_embedding = model.encode_architecture_simple(network)
+            task_embedding = model.encode_task(task_support_images, task_support_labels)
+            with torch.amp.autocast(args.device):
+                # Forward pass directly on query set (without inner loop)
+                query_logits = model(task_query_images, arch_embedding, task_embedding,
+                                     temperature=0.8 if args.k_shot == 1 else 1.0)
+
+            # Compute loss
+            outer_loss = F.cross_entropy(query_logits, task_query_labels)
+
+            # Add domain confusion loss for 1-shot
+            if args.k_shot == 1:
+                query_features = model.extract_multi_scale_features(task_query_images)[0]
+                support_features = model.extract_multi_scale_features(task_support_images)[0]
+
+                # Use detach() to prevent backprop through these features
+                query_features = F.normalize(query_features, dim=1)
+                support_features = F.normalize(support_features, dim=1)
+
+                domain_loss = F.mse_loss(
+                    query_features.mean(0),
+                    support_features.mean(0)
+                ) * 0.1
+
+                outer_loss = outer_loss + domain_loss
+
+            batch_losses.append(outer_loss)
+
+            # Calculate accuracy
+            acc = compute_accuracy(query_logits, task_query_labels)
+            batch_accs.append(acc)
+
+        # Average loss across tasks
+        loss = torch.mean(torch.stack(batch_losses))
+
+        # Apply gradient stabilization
+        success, grad_norms = train_with_gradient_stabilization(model, optimizer, loss, scaler, args)
+
+        if success:
+            train_losses.append(loss.item())
+            train_accs.append(np.mean(batch_accs))
+
+            # Update progress bar
+            train_iter.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'acc': f"{np.mean(batch_accs):.4f}"
+            })
+
+            if scheduler is not None:
+                scheduler.step()
+
+    torch.cuda.empty_cache()
     return np.mean(train_losses), np.mean(train_accs)
 
 def evaluate_arch_aware(model, val_dataset, val_sampler, device, args):
@@ -461,10 +578,10 @@ def evaluate_cross_domain(model, test_dataset, test_sampler, networks, device, a
     return results
 
 
-def train_with_gradient_stabilization(model, optimizer, loss, args):
+def train_with_gradient_stabilization(model, optimizer, loss, scaler, args):
     # Calculate gradient norm before clipping for monitoring
     optimizer.zero_grad()
-    loss.backward()
+    scaler.scale(loss).backward()
 
     # Check for NaN or Inf gradients
     valid_gradients = True
@@ -501,7 +618,10 @@ def train_with_gradient_stabilization(model, optimizer, loss, args):
                 elif 'arch_encoder' in name:
                     torch.nn.utils.clip_grad_norm_([param], clip_value * 0.8)
 
-        # Apply weight decay outside of optimizer - with component-specific values
+        # Create a dictionary to store new gradients
+        new_grads = {}
+
+        # Apply weight decay without in-place operations
         for name, param in model.named_parameters():
             if param.grad is not None and 'bias' not in name and 'layer_norm' not in name:
                 # Use stronger regularization for classifier
@@ -511,10 +631,20 @@ def train_with_gradient_stabilization(model, optimizer, loss, args):
                 elif 'task_encoder' in name:
                     decay_factor = args.wd * 1.2
 
-                param.grad.add_(param * decay_factor)
+                # Create a new gradient tensor instead of modifying in-place
+                new_grads[name] = param.grad.clone() + param * decay_factor
+
+        # Set the new gradients
+        with torch.no_grad():
+            for name, grad in new_grads.items():
+                for n, p in model.named_parameters():
+                    if n == name:
+                        p.grad = grad
+                        break
 
         # Step optimizer
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         return True, grad_norms
 
@@ -522,7 +652,6 @@ def train_with_gradient_stabilization(model, optimizer, loss, args):
     print("Skipping batch due to invalid gradients")
     optimizer.zero_grad()
     return False, {}
-
 
 def adjust_network_for_cifar(network):
     """Adapt ImageNet pretrained networks for CIFAR-100 images (32x32)"""
@@ -686,7 +815,7 @@ def main():
             config=vars(args),
             name=f"arch_aware_ghn_{args.n_way}way_{args.k_shot}shot"
         )
-
+    torch.autograd.set_detect_anomaly(True)
     # Set device
     device = torch.device(args.device)
 
@@ -724,7 +853,7 @@ def main():
 
     # Create network family for architecture variety
     networks = create_network_family()
-
+    scaler = torch.amp.GradScaler(args.device)
     # Create model
     model = TaskAwareGHN(
         arch_embed_dim=args.arch_embed_dim,
@@ -777,7 +906,7 @@ def main():
         print(f"\nEpoch {epoch + 1}/{args.epochs} - Phase {phase} - LR: {scheduler.get_last_lr()[0]:.6f}")
 
         # Training with architecture variety
-        train_loss, train_acc = meta_training(model, train_dataset, train_sampler, networks, optimizer,scheduler, device, args)
+        train_loss, train_acc = meta_training(model, train_dataset, train_sampler, networks, optimizer,scheduler,scaler, device, args)
         print(f"Training - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
 
         # Validation
