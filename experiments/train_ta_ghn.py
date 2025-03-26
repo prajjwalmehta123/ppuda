@@ -579,79 +579,46 @@ def evaluate_cross_domain(model, test_dataset, test_sampler, networks, device, a
 
 
 def train_with_gradient_stabilization(model, optimizer, loss, scaler, args):
-    # Calculate gradient norm before clipping for monitoring
+    # For mixed precision, use safer approach
     optimizer.zero_grad()
-    scaler.scale(loss).backward()
 
-    # Check for NaN or Inf gradients
-    valid_gradients = True
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                valid_gradients = False
-                print(f"Warning: NaN or Inf gradients in {name}")
-                break
+    # Check if loss is valid before backward
+    if torch.isnan(loss) or torch.isinf(loss):
+        print("Warning: Loss is NaN or Inf, skipping batch")
+        return False, {}
 
-    if valid_gradients:
-        # Calculate gradient norm by parameter group for monitoring
-        grad_norms = {}
-        for name, param in model.named_parameters():
+    # Use stable scaling for mixed precision
+    try:
+        scaler.scale(loss).backward()
+
+        # Check for NaN/Inf gradients before optimizer step
+        valid_gradients = True
+        for name, param in model.parameters():
             if param.grad is not None:
-                param_key = name.split('.')[0]  # Group by top-level module
-                if param_key not in grad_norms:
-                    grad_norms[param_key] = 0
-                grad_norms[param_key] += param.grad.norm().item()
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    valid_gradients = False
+                    print(f"Warning: NaN or Inf gradients in {name}")
+                    break
 
-        # Apply gradient clipping with adaptive threshold for 1-shot
-        clip_value = args.grad_clip
-        if args.k_shot == 1:
-            # More aggressive clipping for 1-shot to prevent overfitting
-            clip_value = args.grad_clip * 0.8
+        if valid_gradients:
+            # Apply gradient clipping with lower threshold
+            scaler.unscale_(optimizer)
+            clip_value = args.grad_clip * 0.5  # More aggressive clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+            # Update with scaler
+            scaler.step(optimizer)
+            scaler.update()
+            return True, {}
+        else:
+            # Skip update but still update scaler
+            scaler.update()
+            return False, {}
 
-        # Separate clipping for different component groups for better stability
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                if 'task_encoder' in name:
-                    torch.nn.utils.clip_grad_norm_([param], clip_value * 0.9)
-                elif 'arch_encoder' in name:
-                    torch.nn.utils.clip_grad_norm_([param], clip_value * 0.8)
-
-        # Create a dictionary to store new gradients
-        new_grads = {}
-
-        # Apply weight decay without in-place operations
-        for name, param in model.named_parameters():
-            if param.grad is not None and 'bias' not in name and 'layer_norm' not in name:
-                # Use stronger regularization for classifier
-                decay_factor = args.wd
-                if 'classifier' in name:
-                    decay_factor = args.wd * 1.5
-                elif 'task_encoder' in name:
-                    decay_factor = args.wd * 1.2
-
-                # Create a new gradient tensor instead of modifying in-place
-                new_grads[name] = param.grad.clone() + param * decay_factor
-
-        # Set the new gradients
-        with torch.no_grad():
-            for name, grad in new_grads.items():
-                for n, p in model.named_parameters():
-                    if n == name:
-                        p.grad = grad
-                        break
-
-        # Step optimizer
-        scaler.step(optimizer)
-        scaler.update()
-
-        return True, grad_norms
-
-    # Skip this batch if gradients are invalid
-    print("Skipping batch due to invalid gradients")
-    optimizer.zero_grad()
-    return False, {}
+    except RuntimeError as e:
+        print(f"Error in backward/optimization: {str(e)}")
+        scaler.update()  # Still update scaler
+        return False, {}
 
 def adjust_network_for_cifar(network):
     """Adapt ImageNet pretrained networks for CIFAR-100 images (32x32)"""
