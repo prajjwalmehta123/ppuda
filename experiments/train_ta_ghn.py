@@ -474,8 +474,8 @@ def train_with_gradient_stabilization(model, optimizer, loss, args):
 def setup_progressive_training(model, epoch, total_epochs, k_shot):
     """Configure model for progressive training with 1-shot specific handling."""
     # Adapt phase boundaries based on shot count
-    phase1_end = total_epochs // 3 if k_shot > 1 else total_epochs // 4
-    phase2_end = 2 * total_epochs // 3 if k_shot > 1 else 3 * total_epochs // 5
+    phase1_end = total_epochs // 3
+    phase2_end = 2 * total_epochs // 3
 
     phase = 1
     if epoch < phase1_end:
@@ -633,7 +633,7 @@ def main():
         n_way=args.n_way,
         k_shot=args.k_shot,
         query_size=args.query_size,
-        seed=args.seed + 1  # Different seed for validation
+        seed=args.seed
     )
 
     # Create network family for architecture variety

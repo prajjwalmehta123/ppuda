@@ -257,7 +257,7 @@ class TaskAwareGHN(nn.Module):
         """Normalize parameters based on their type for stable activation distributions."""
         if param_type == 'conv_weight':
             # Fan-in normalization
-            fan_in = np.prod(params.shape[1:])
+            fan_in = np.prod(params.shape[1:]) if params.dim() > 1 else 1.0
             return params * (2.0 / fan_in) ** 0.5
         elif param_type == 'bn_weight':
             # BN weights are typically around 1.0
@@ -270,8 +270,12 @@ class TaskAwareGHN(nn.Module):
             return 0.1 * torch.tanh(params / 0.5)
         elif param_type == 'fc_weight':
             # FC weights use similar normalization as conv weights
-            fan_in = params.shape[1]
-            return params * (2.0 / fan_in) ** 0.5
+            if params.dim() > 1:
+                fan_in = params.shape[1]
+                return params * (2.0 / fan_in) ** 0.5
+            else:
+                # Handle the case where the parameter is 1D
+                return 0.1 * torch.tanh(params / 0.5)  # Use similar scaling as biases
         else:
             # Default normalization for stability
             return params * 0.1
