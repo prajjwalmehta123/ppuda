@@ -123,20 +123,28 @@ class TaskAwareGHN(nn.Module):
         if network_id in self.arch_embedding_cache:
             return self.arch_embedding_cache[network_id]
 
-
+        model_device = next(self.parameters()).device
+        try:
+            # Get network device
+            for param in network.parameters():
+                network_device = param.device
+                if network_device != model_device:
+                    print(f"Moving network from {network_device} to {model_device}")
+                    network = network.to(model_device)
+                break
+        except Exception as e:
+            print(f"Device detection error: {e}")
 
         if not hasattr(self, 'graph_builder'):
             self.graph_builder = ArchitectureGraphBuilder(ve_cutoff=self.ve_cutoff)
-
         # Build graph
         graph = self.graph_builder.build_graph(network)
 
+        graph_batch = GraphBatch([graph])
+        graph_batch = graph_batch.to_device(model_device)
+
         # Process through GHN2's encoder
         with torch.no_grad():
-            # Convert to batch
-            graph_batch = GraphBatch([graph])
-            graph_batch = graph_batch.to_device(self.device)
-
             # Get node features using GHN2's embedding layer
             node_features = self.ghn2.embed(graph_batch.node_feat[:, 0])
 

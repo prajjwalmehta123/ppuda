@@ -43,10 +43,18 @@ class ArchitectureGraphBuilder:
         # Ensure training mode for graph construction
         network.train()
 
+        device = None
+        for param in network.parameters():
+            device = param.device
+            break
+        if device is None:
+            # Fallback to CPU if no parameters found
+            device = torch.device('cpu')
+
         # Create a context where gradients are enabled
         with torch.enable_grad():
             # Create a dummy input that requires grad
-            dummy_input = torch.randn(2, 3, 32, 32, requires_grad=True)
+            dummy_input = torch.randn(2, 3, 32, 32, requires_grad=True,device=device)
 
             # Get output with grad tracking
             try:
