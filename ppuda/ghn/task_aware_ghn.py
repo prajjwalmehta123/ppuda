@@ -1,27 +1,17 @@
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torch
 
-from ppuda.deepnets1m.graph import GraphBatch
 from ppuda.deepnets1m.architecture import ArchitectureGraphBuilder, ArchitectureEncoder, JointParameterGenerator
 from ppuda.task.task_encoder import TaskEncoder
+from ppuda.deepnets1m.graph import Graph, GraphBatch
 
 
 class TaskAwareGHN(nn.Module):
-    """
-    Hybrid GHN for few-shot learning.
-    Uses both architecture and task information to predict parameters.
-    """
-
-    def __init__(self,
-                 feature_dim=512,
-                 arch_embed_dim=128,
-                 task_embed_dim=128,
-                 hidden_dim=256,
-                 num_classes=5,
-                 device='cpu',
-                 ve_cutoff=50):
+    def __init__(self, feature_dim=512, arch_embed_dim=128, task_embed_dim=128,
+                 hidden_dim=256, num_classes=5, device='cpu', ve_cutoff=50, ghn2=None):
         super().__init__()
         self.feature_dim = feature_dim
         self.arch_embed_dim = arch_embed_dim
@@ -30,275 +20,43 @@ class TaskAwareGHN(nn.Module):
         self.num_classes = num_classes
         self.device = device
         self.ve_cutoff = ve_cutoff
-        self.multi_scale_dim = 128 * 3
+        self.ghn2 = ghn2
+
         # Feature extractor (frozen ResNet backbone)
         self.backbone = models.resnet18(pretrained=True)
         self.backbone.fc = nn.Identity()  # Remove classification layer
-        self.backbone = self.backbone.to(device)
-
-        # Freeze backbone parameters
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # Architecture graph builder
-        self.graph_builder = ArchitectureGraphBuilder(ve_cutoff=ve_cutoff)
-
-        # Architecture encoder
-        self.arch_encoder = ArchitectureEncoder(
-            embedding_dim=arch_embed_dim,
-            hidden_dim=hidden_dim // 2,
-            ve=True,
-            layernorm=True
-        ).to(device)
-
         # Task encoder
-        self.task_encoder = nn.Sequential(
-            nn.Linear(self.multi_scale_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, task_embed_dim)
-        ).to(device)
+        self.task_encoder = TaskEncoder(feature_dim, task_embed_dim).to(device)
 
-        # Joint parameter generator
+        # Adaptation modules
+        self.adapt_layer1 = AdaptationModule(64, arch_embed_dim=arch_embed_dim).to(device)
+        self.adapt_layer2 = AdaptationModule(128, arch_embed_dim=arch_embed_dim).to(device)
+        self.adapt_layer3 = AdaptationModule(256, arch_embed_dim=arch_embed_dim).to(device)
+        self.adapt_layer4 = AdaptationModule(512, arch_embed_dim=arch_embed_dim).to(device)
+
+        # Parameter generator
         self.param_generator = JointParameterGenerator(
             arch_dim=arch_embed_dim,
             task_dim=task_embed_dim,
             hidden_dim=hidden_dim
         ).to(device)
 
-        # Adaptation modules (parameters will be predicted by GHN)
-        self.layer1_proj = nn.Conv2d(64, 128, kernel_size=1).to(device)
-        self.layer2_proj = nn.Conv2d(128, 128, kernel_size=1).to(device)
-        self.layer3_proj = nn.Conv2d(256, 128, kernel_size=1).to(device)
-        self.layer4_proj = nn.Conv2d(512, 128, kernel_size=1).to(device)
-
-        self.adapt_layer1 = AdaptationModule(64, arch_embed_dim=arch_embed_dim).to(device)
-        self.adapt_layer2 = AdaptationModule(128, arch_embed_dim=arch_embed_dim).to(device)
-        self.adapt_layer3 = AdaptationModule(256, arch_embed_dim=arch_embed_dim).to(device)
-        self.adapt_layer4 = AdaptationModule(512, arch_embed_dim=arch_embed_dim).to(device)
         # Final classification layer
         self.classifier = nn.Linear(feature_dim, num_classes).to(device)
 
-        # Cache for architecture embeddings
-        self.arch_embedding_cache = {}
-        self.simple_projection = nn.Linear(9, self.arch_embed_dim).to(device)
+        self.simple_projection = nn.Linear(5, self.arch_embed_dim).to(device)
+
         nn.init.orthogonal_(self.simple_projection.weight)
-        self.to(device)
 
-    def encode_architecture_simple(self, network):
-        """
-        A simplified architecture encoding that doesn't rely on autograd.
-        """
-        # Generate a fixed embedding based on network characteristics
-        network_id = id(network)
-        if network_id in self.arch_embedding_cache:
-            return self.arch_embedding_cache[network_id]
-
-        # Create a feature vector describing the architecture
-        arch_features = []
-
-        # Count layers by type
-        layer_counts = {}
-        for name, module in network.named_modules():
-            layer_type = type(module).__name__
-            if layer_type not in layer_counts:
-                layer_counts[layer_type] = 0
-            layer_counts[layer_type] += 1
-
-        # Check if layer1 exists and is not an Identity
-        if hasattr(network, 'layer1') and not isinstance(network.layer1, nn.Identity):
-            if hasattr(network.layer1, '__len__'):
-                arch_features.append(len(network.layer1))
-            else:
-                arch_features.append(1)  # Single layer
-        else:
-            arch_features.append(0)
-
-        # Check if layer2 exists and is not an Identity
-        if hasattr(network, 'layer2') and not isinstance(network.layer2, nn.Identity):
-            if hasattr(network.layer2, '__len__'):
-                arch_features.append(len(network.layer2))
-            else:
-                arch_features.append(1)  # Single layer
-        else:
-            arch_features.append(0)
-
-        # Check if layer3 exists and is not an Identity
-        if hasattr(network, 'layer3') and not isinstance(network.layer3, nn.Identity):
-            if hasattr(network.layer3, '__len__'):
-                arch_features.append(len(network.layer3))
-            else:
-                arch_features.append(1)  # Single layer
-        else:
-            arch_features.append(0)
-
-        # Check if layer4 exists and is not an Identity
-        if hasattr(network, 'layer4') and not isinstance(network.layer4, nn.Identity):
-            if hasattr(network.layer4, '__len__'):
-                arch_features.append(len(network.layer4))
-            else:
-                arch_features.append(1)  # Single layer
-        else:
-            arch_features.append(0)
-
-        # Layer type distribution features
-        for layer_type in ['Conv2d', 'BatchNorm2d', 'Linear', 'MaxPool2d', 'AvgPool2d']:
-            arch_features.append(layer_counts.get(layer_type, 0))
-
-        # Convert to tensor and normalize
-        arch_features = torch.tensor(arch_features, dtype=torch.float32, device=self.device)
-        arch_features = arch_features / (arch_features.sum() + 1e-6)
-
-        # Project to the right dimension
-        arch_embedding = self.simple_projection(arch_features)
-
-        # Cache the embedding
-        self.arch_embedding_cache[network_id] = arch_embedding
-
-        return arch_embedding
-
-    def extract_multi_scale_features(self, support_images):
-        """
-        Extract multi-scale features from the backbone network.
-
-        Args:
-            support_images: Support images tensor
-
-        Returns:
-            Multi-scale features tensor
-        """
-        if support_images.device != self.backbone.conv1.weight.device:
-            # Force the backbone to the right device
-            self.backbone = self.backbone.to(support_images.device)
-        # Forward pass through initial layers
-        x = self.backbone.conv1(support_images)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
-
-        # Extract features from different layers
-        f1 = self.backbone.layer1(x)
-        f2 = self.backbone.layer2(f1)
-        f3 = self.backbone.layer3(f2)
-        f4 = self.backbone.layer4(f3)
-
-        # Project and pool features to the same dimensionality
-        p1 = F.adaptive_avg_pool2d(self.layer1_proj(f1), 1)
-        p2 = F.adaptive_avg_pool2d(self.layer2_proj(f2), 1)
-        p3 = F.adaptive_avg_pool2d(self.layer3_proj(f3), 1)
-        p4 = F.adaptive_avg_pool2d(self.layer4_proj(f4), 1)  # Last layer already has 512 channels
-
-        # Concatenate features from different scales
-        combined = torch.cat([
-            p1.view(p1.size(0), -1),
-            p2.view(p2.size(0), -1),
-            p4.view(p4.size(0), -1)  # Using layers 1, 2, and 4 for diverse scales
-        ], dim=1)
-
-        return combined, f1, f2, f3, f4
+        # Architecture embedding cache
+        self.arch_embedding_cache = {}
 
     def encode_task(self, support_images, support_labels):
-        """
-        Extract task representation from support set.
-
-        Args:
-            support_images: Tensor of support images
-            support_labels: Tensor of support labels
-
-        Returns:
-            Task embedding tensor
-        """
-        # Extract multi-scale features
-        features, f1, f2, f3, f4 = self.extract_multi_scale_features(support_images)
-
-        # Get the actual feature dimension
-        actual_feature_dim = features.shape[1]
-
-        # Check if task_encoder was initialized with the correct dimensions
-        if not hasattr(self, "_dimension_fixed") and actual_feature_dim != self.multi_scale_dim:
-            print(f"Fixing dimension mismatch: {actual_feature_dim} vs {self.multi_scale_dim}")
-            # Recreate task encoder with correct dimensions
-            self.multi_scale_dim = actual_feature_dim
-            self.task_encoder = nn.Sequential(
-                nn.Linear(self.multi_scale_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(self.hidden_dim, self.task_embed_dim)
-            ).to(self.device)
-            self._dimension_fixed = True
-
-        # Compute class prototypes - enhanced for 1-shot
-        prototypes = []
-        for c in range(self.num_classes):
-            class_mask = (support_labels == c)
-            if class_mask.sum() > 0:
-                class_features = features[class_mask]
-                prototypes.append(class_features.mean(0))
-            else:
-                prototypes.append(torch.zeros_like(features[0]))
-
-        proto_tensor = torch.stack(prototypes)
-        relation_features = []
-        for i in range(len(prototypes)):
-            diffs = proto_tensor - proto_tensor[i].unsqueeze(0)
-            distances = torch.norm(diffs, dim=1)
-            relation_features.append(distances)
-        relation_tensor = torch.stack(relation_features).mean(0)
-        proto_mean = proto_tensor.mean(0)
-
-        relation_dim = self.num_classes
-        task_features = proto_mean.clone()
-        relation_scale = 0.3  # Hyperparameter to control influence
-        task_features[:relation_dim] = task_features[:relation_dim] * (
-                    1 - relation_scale) + relation_tensor * relation_scale
-
-        return self.task_encoder(task_features)
-
-    def normalize_adaptation_params(self, temperature=0.8):
-        """Normalize adaptation parameters for better generalization"""
-        for module in [self.adapt_layer1, self.adapt_layer2,
-                       self.adapt_layer3, self.adapt_layer4]:
-            # Normalize weights with scaling factor
-            if hasattr(module, 'fc1') and hasattr(module.fc1, 'weight'):
-                norm = module.fc1.weight.norm()
-                if norm > 0:
-                    module.fc1.weight.data = module.fc1.weight.data * (1.0 / norm) * temperature
-
-            if hasattr(module, 'fc2') and hasattr(module.fc2, 'weight'):
-                norm = module.fc2.weight.norm()
-                if norm > 0:
-                    module.fc2.weight.data = module.fc2.weight.data * (1.0 / norm) * temperature
-
-
-    def set_adaptation_params(self, arch_embedding, task_embedding, temperature=1.0):
-        """
-        Use parameter generator to predict parameters for all adaptation modules.
-
-        Args:
-            arch_embedding: Architecture embedding tensor
-            task_embedding: Task embedding tensor
-        """
-        # Generate parameters for each adaptation module
-        params_layer1 = self.param_generator(arch_embedding, task_embedding, 64)
-        params_layer2 = self.param_generator(arch_embedding, task_embedding, 128)
-        params_layer3 = self.param_generator(arch_embedding, task_embedding, 256)
-        params_layer4 = self.param_generator(arch_embedding, task_embedding, 512)
-        self.normalize_adaptation_params(temperature)
-
-        if temperature != 1.0:
-            for params in [params_layer1, params_layer2, params_layer3, params_layer4]:
-                for k, v in params.items():
-                    if 'weight' in k:
-                        # Scale weights to control adaptation strength
-                        params[k] = v * temperature
-
-        # Set parameters for adaptation modules
-        self._set_module_params(self.adapt_layer1, params_layer1)
-        self._set_module_params(self.adapt_layer2, params_layer2)
-        self._set_module_params(self.adapt_layer3, params_layer3)
-        self._set_module_params(self.adapt_layer4, params_layer4)
+        """Encode task from support set images and labels."""
+        return self.task_encoder(support_images, support_labels, self.num_classes)
 
     def _set_module_params(self, module, params_dict):
         """Helper to set parameters for a module."""
@@ -326,24 +84,141 @@ class TaskAwareGHN(nn.Module):
             # Set the parameter
             setattr(target_module, param_name, nn.Parameter(param))
 
-    def forward(self, query_images, arch_embedding=None, task_embedding=None,temperature=1.0):
-        """
-        Process query images with task-specific and architecture-aware adaptation.
 
-        Args:
-            query_images: Query images tensor
-            arch_embedding: Architecture embedding tensor (optional)
-            task_embedding: Task embedding tensor (optional)
+    def encode_architecture_simple(self, network):
+        """A simplified architecture encoding that doesn't rely on GHN2"""
+        # Check cache first
+        network_id = id(network)
+        if network_id in self.arch_embedding_cache:
+            return self.arch_embedding_cache[network_id]
 
-        Returns:
-            Class logits for query images
-        """
+        # Create a feature vector describing the architecture
+        arch_features = [
+            # Count layers by type
+            sum(1 for _ in network.modules() if isinstance(_, nn.Conv2d)),
+            sum(1 for _ in network.modules() if isinstance(_, nn.BatchNorm2d)),
+            sum(1 for _ in network.modules() if isinstance(_, nn.Linear)),
+            # Depth features
+            len(network.modules()) // 10,
+            # Network width approximation
+            sum(m.out_channels for m in network.modules()
+                if isinstance(m, nn.Conv2d)) // 100
+        ]
+
+        # Normalize features
+        arch_features = torch.tensor(arch_features, dtype=torch.float32, device=self.device)
+        arch_features = arch_features / (arch_features.sum() + 1e-6)
+
+        # Project to embedding dimension
+        arch_embedding = self.simple_projection(arch_features)
+
+        # Cache and return
+        self.arch_embedding_cache[network_id] = arch_embedding
+        return arch_embedding
+
+    def encode_architecture_ghn2(self, network):
+        """Encode architecture using GHN2's graph neural network."""
+        # Check if we have a cached embedding
+        network_id = id(network)
+        if network_id in self.arch_embedding_cache:
+            return self.arch_embedding_cache[network_id]
+
+
+
+        if not hasattr(self, 'graph_builder'):
+            self.graph_builder = ArchitectureGraphBuilder(ve_cutoff=self.ve_cutoff)
+
+        # Build graph
+        graph = self.graph_builder.build_graph(network)
+
+        # Process through GHN2's encoder
+        with torch.no_grad():
+            # Convert to batch
+            graph_batch = GraphBatch([graph])
+            graph_batch = graph_batch.to_device(self.device)
+
+            # Get node features using GHN2's embedding layer
+            node_features = self.ghn2.embed(graph_batch.node_feat[:, 0])
+
+            # Process through GatedGNN
+            node_embeddings = self.ghn2.gnn(node_features, graph_batch.edges, graph_batch.node_feat[:, 1])
+
+            # Apply layer normalization if available
+            if hasattr(self.ghn2, 'ln'):
+                node_embeddings = self.ghn2.ln(node_embeddings)
+
+            # Pool node embeddings to get graph embedding
+            arch_embedding = node_embeddings.mean(dim=0)
+
+            # Project to the right dimensionality if needed
+            if hasattr(self, 'arch_projector'):
+                arch_embedding = self.arch_projector(arch_embedding)
+
+        # Cache and return
+        self.arch_embedding_cache[network_id] = arch_embedding
+        return arch_embedding
+
+    def extract_multi_scale_features(self, x):
+        """Extract features from multiple layers of the backbone network."""
+        # Forward through stem
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+
+        # Extract features from different layers
+        f1 = self.backbone.layer1(x)
+        f2 = self.backbone.layer2(f1)
+        f3 = self.backbone.layer3(f2)
+        f4 = self.backbone.layer4(f3)
+
+        # Process through projection layers
+        if hasattr(self, 'layer1_proj'):
+            p1 = F.adaptive_avg_pool2d(self.layer1_proj(f1), 1).flatten(1)
+            p2 = F.adaptive_avg_pool2d(self.layer2_proj(f2), 1).flatten(1)
+            p3 = F.adaptive_avg_pool2d(self.layer3_proj(f3), 1).flatten(1)
+
+            # Concatenate for a multi-scale representation
+            combined = torch.cat([p1, p2, p3], dim=1)
+        else:
+            # If projection layers aren't available, use global pooling
+            p1 = F.adaptive_avg_pool2d(f1, 1).flatten(1)
+            p2 = F.adaptive_avg_pool2d(f2, 1).flatten(1)
+            p3 = F.adaptive_avg_pool2d(f3, 1).flatten(1)
+            p4 = F.adaptive_avg_pool2d(f4, 1).flatten(1)
+
+            combined = torch.cat([p1, p2, p3, p4], dim=1)
+
+        return combined, f1, f2, f3, f4
+
+    def set_adaptation_params(self, arch_embedding, task_embedding, temperature=1.0):
+        """Use parameter generator to predict parameters for all adaptation modules."""
+        # Generate parameters for each adaptation module
+        params_layer1 = self.param_generator(arch_embedding, task_embedding, 64)
+        params_layer2 = self.param_generator(arch_embedding, task_embedding, 128)
+        params_layer3 = self.param_generator(arch_embedding, task_embedding, 256)
+        params_layer4 = self.param_generator(arch_embedding, task_embedding, 512)
+
+        # Optional temperature scaling
+        if temperature != 1.0:
+            for params in [params_layer1, params_layer2, params_layer3, params_layer4]:
+                for k, v in params.items():
+                    if 'weight' in k:
+                        params[k] = v * temperature
+
+        # Set parameters for each adaptation module
+        self._set_module_params(self.adapt_layer1, params_layer1)
+        self._set_module_params(self.adapt_layer2, params_layer2)
+        self._set_module_params(self.adapt_layer3, params_layer3)
+        self._set_module_params(self.adapt_layer4, params_layer4)
+
+    def forward(self, query_images, arch_embedding=None, task_embedding=None, temperature=1.0):
+        """Process query images with task-specific and architecture-aware adaptation."""
         if arch_embedding is not None and task_embedding is not None:
             # Use arch and task embeddings to predict adaptation module parameters
-            self.set_adaptation_params(arch_embedding, task_embedding,temperature)
+            self.set_adaptation_params(arch_embedding, task_embedding, temperature)
 
         # Apply backbone with adaptation modules
-        # First part of ResNet
         x = self.backbone.conv1(query_images)
         x = self.backbone.bn1(x)
         x = self.backbone.relu(x)
@@ -351,31 +226,53 @@ class TaskAwareGHN(nn.Module):
 
         # Layer 1 with adaptation
         x = self.backbone.layer1(x)
-        x = self.adapt_layer1(x,arch_embedding if arch_embedding is not None else None)
+        x = self.adapt_layer1(x, arch_embedding)
 
         # Layer 2 with adaptation
         x = self.backbone.layer2(x)
-        x = self.adapt_layer2(x,arch_embedding if arch_embedding is not None else None)
+        x = self.adapt_layer2(x, arch_embedding)
 
         # Layer 3 with adaptation
         x = self.backbone.layer3(x)
-        x = self.adapt_layer3(x,arch_embedding if arch_embedding is not None else None)
+        x = self.adapt_layer3(x, arch_embedding)
 
         # Layer 4 with adaptation
         x = self.backbone.layer4(x)
-        x = self.adapt_layer4(x,arch_embedding if arch_embedding is not None else None)
+        x = self.adapt_layer4(x, arch_embedding)
 
         # Global pooling and classification
         x = F.adaptive_avg_pool2d(x, 1)
         features = torch.flatten(x, 1)
         return self.classifier(features)
 
+    def normalize_parameters(self, params, param_type):
+        """Normalize parameters based on their type for stable activation distributions."""
+        if param_type == 'conv_weight':
+            # Fan-in normalization
+            fan_in = np.prod(params.shape[1:])
+            return params * (2.0 / fan_in) ** 0.5
+        elif param_type == 'bn_weight':
+            # BN weights are typically around 1.0
+            return 2 * torch.sigmoid(params / 1.0)
+        elif param_type == 'ln_weight':
+            # LN weights are similar to BN
+            return 2 * torch.sigmoid(params / 1.0)
+        elif param_type == 'bias':
+            # Biases are typically small
+            return 0.1 * torch.tanh(params / 0.5)
+        elif param_type == 'fc_weight':
+            # FC weights use similar normalization as conv weights
+            fan_in = params.shape[1]
+            return params * (2.0 / fan_in) ** 0.5
+        else:
+            # Default normalization for stability
+            return params * 0.1
+
 
 class AdaptationModule(nn.Module):
     def __init__(self, in_channels, reduction=4,arch_embed_dim=128):
         super().__init__()
         self.in_channels = in_channels
-        self.reduction = reduction
         self.mid_channels = in_channels // reduction
 
         # Channel attention path
@@ -384,52 +281,50 @@ class AdaptationModule(nn.Module):
 
         # Spatial attention path
         self.conv_spatial = nn.Conv2d(2, 1, kernel_size=7, padding=3)
+
+        # Layer normalization for stability
+        self.layer_norm = nn.LayerNorm(in_channels)
+
         self.arch_projection = nn.Sequential(
             nn.Linear(arch_embed_dim, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
             nn.Linear(256, in_channels),
+            nn.Sigmoid()
         )
-
-        # Layer normalization for better stability
-        self.layer_norm = nn.LayerNorm(in_channels)
 
     def forward(self, x, arch_embedding=None):
         # Original input for residual connection
         identity = x
 
         # Channel attention
-        b, c = x.shape[0], x.shape[1]
-
-        # Global average pooling
-        y_channel = F.adaptive_avg_pool2d(x, 1).view(b, c)
-
-        # Apply channel attention
+        y_channel = F.adaptive_avg_pool2d(x, 1).view(x.shape[0], -1)
         y_channel = F.relu(self.fc1(y_channel))
         y_channel = torch.sigmoid(self.fc2(y_channel))
 
+        # Apply conditional scaling if architecture embedding is available
         if arch_embedding is not None:
-            # Project architecture embedding to scaling factors
-            arch_scale = torch.sigmoid(
-                self.arch_projection(arch_embedding)
-            ).view(1, -1, 1, 1)
-            scale_factors = 0.5 + 0.5 * arch_scale.squeeze(0).squeeze(-1).squeeze(-1)
+            # Use architecture information to modulate channel attention
+            if arch_embedding.dim() == 1:
+                arch_embedding = arch_embedding.unsqueeze(0)
+            scale_factors = self.arch_projection(arch_embedding)
+            if scale_factors.dim() == 1:
+                scale_factors = scale_factors.unsqueeze(0)
+            if scale_factors.size(0) == 1 and y_channel.size(0) > 1:
+                scale_factors = scale_factors.expand(y_channel.size(0), -1)
             y_channel = y_channel * scale_factors
 
         # Apply channel attention weights
-        x_channel = x * y_channel.view(b, c, 1, 1)
+        x_channel = x * y_channel.view(x.shape[0], -1, 1, 1)
 
         # Spatial attention
         avg_pool = torch.mean(x, dim=1, keepdim=True)
         max_pool, _ = torch.max(x, dim=1, keepdim=True)
         y_spatial = torch.cat([avg_pool, max_pool], dim=1)
-        y_spatial = self.conv_spatial(y_spatial)
-        y_spatial = torch.sigmoid(y_spatial)
-
-        # Apply spatial attention
+        y_spatial = torch.sigmoid(self.conv_spatial(y_spatial))
         x_spatial = x * y_spatial
 
-        # Combine attentions with residual connection
+        # Combine attention mechanisms with residual connection
         x = identity + x_channel + x_spatial
 
         # Apply layer normalization (converted to the right shape)

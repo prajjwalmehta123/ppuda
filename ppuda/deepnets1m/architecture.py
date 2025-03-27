@@ -73,9 +73,6 @@ class ArchitectureGraphBuilder:
         return GraphBatch(graphs)
 
 
-
-
-
 class ArchitectureEncoder(nn.Module):
     """Encodes neural network architectures using graph neural networks."""
 
@@ -178,6 +175,7 @@ class JointParameterGenerator(nn.Module):
             '512': self._create_decoder(512, hidden_dim)
         })
 
+
     def _create_decoder(self, channels, hidden_dim):
         """Create decoder for a specific channel size."""
         reduction = 4
@@ -201,8 +199,12 @@ class JointParameterGenerator(nn.Module):
         )
 
     def forward(self, arch_embedding, task_embedding, channel_size):
-        """Generate parameters based on architecture and task embeddings."""
         # Normalize embeddings
+        if arch_embedding.dim() == 1:
+            arch_embedding = arch_embedding.unsqueeze(0)
+        if task_embedding.dim() == 1:
+            task_embedding = task_embedding.unsqueeze(0)
+
         arch_embedding = self.arch_norm(arch_embedding)
         task_embedding = self.task_norm(task_embedding)
 
@@ -212,31 +214,18 @@ class JointParameterGenerator(nn.Module):
         conditioned_arch = arch_embedding * scale + bias * 0.1
 
         # Combine embeddings
-        joint_embedding = torch.cat([conditioned_arch, task_embedding], dim=0)
+        joint_embedding = torch.cat([conditioned_arch, task_embedding], dim=1)
 
         # Process joint embedding
         processed_embedding = self.joint_processor(joint_embedding)
+        processed_embedding = processed_embedding.squeeze(0)
 
         # Generate parameters using the appropriate decoder
         decoder = self.decoders[str(channel_size)]
 
         params = {}
         for key, module in decoder.items():
-            out_shape = None
-            if key == 'fc1_weight':
-                out_shape = (channel_size // 4, channel_size)
-            elif key == 'fc1_bias':
-                out_shape = (channel_size // 4,)
-            elif key == 'fc2_weight':
-                out_shape = (channel_size, channel_size // 4)
-            elif key == 'fc2_bias':
-                out_shape = (channel_size,)
-            elif key == 'conv_spatial_weight':
-                out_shape = (1, 2, 7, 7)
-            elif key == 'conv_spatial_bias':
-                out_shape = (1,)
-
-            params[key] = module(processed_embedding).reshape(out_shape)
+            params[key] = module(processed_embedding)
 
         return params
 

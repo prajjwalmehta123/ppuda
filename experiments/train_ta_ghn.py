@@ -20,6 +20,8 @@ import wandb
 from ppuda.deepnets1m.architecture import robust_network_adaptation
 from ppuda.ghn.task_aware_ghn import TaskAwareGHN
 from ppuda.task.task_sampler import TaskSampler, ClassSubset
+from ppuda.ghn.nn import GHN
+from ppuda.utils.network_utils import initialize_from_ghn2
 
 def get_dataset(dataset_name, data_dir, is_train=True):
     """Get dataset for few-shot learning."""
@@ -119,12 +121,7 @@ def compute_meta_loss(model, task_support_images, task_support_labels,
     return total_loss, classification_loss.item(), compute_accuracy(query_logits, task_query_labels)
 
 def augment_support_set(support_images, support_labels, n_way, k_shot):
-    """
-    """
-    if k_shot > 1:
-        return support_images, support_labels
 
-    # Define transformations for augmentation
     augment_transforms = [
         transforms.ToPILImage(),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -158,11 +155,15 @@ def augment_support_set(support_images, support_labels, n_way, k_shot):
 
     return torch.stack(augmented_support), torch.tensor(augmented_labels,
                                                         device=support_labels.device)
-"""
-def meta_training(model, train_dataset, train_sampler, networks, optimizer,scheduler, device, args):
+
+def meta_training(model, train_dataset, train_sampler, networks, optimizer, scheduler, device, args):
     model.train()
     train_losses = []
     train_accs = []
+
+    # Create gradient scaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=torch.cuda.is_available() and hasattr(args, 'mixed_precision') and args.mixed_precision)
 
     train_iter = tqdm(range(args.steps_per_epoch), desc=f"Training")
     for step in train_iter:
@@ -185,15 +186,10 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
 
         for i in range(args.meta_batch_size):
             # Get task-specific data
-            start_idx = i * args.n_way * args.k_shot
-            end_idx = (i + 1) * args.n_way * args.k_shot
-            task_support_images = support_images[start_idx:end_idx]
-            task_support_labels = support_labels[start_idx:end_idx]
-
-            start_idx = i * args.n_way * args.query_size
-            end_idx = (i + 1) * args.n_way * args.query_size
-            task_query_images = query_images[start_idx:end_idx]
-            task_query_labels = query_labels[start_idx:end_idx]
+            task_support_images = get_task_slice(support_images, i, args.n_way, args.k_shot)
+            task_support_labels = get_task_slice(support_labels, i, args.n_way, args.k_shot)
+            task_query_images = get_task_slice(query_images, i, args.n_way, args.query_size)
+            task_query_labels = get_task_slice(query_labels, i, args.n_way, args.query_size)
 
             if args.k_shot == 1:
                 task_support_images, task_support_labels = augment_support_set(
@@ -204,8 +200,12 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
             network_idx = np.random.randint(len(networks))
             network = networks[network_idx].to(device)
 
-            # Use the simple architecture encoder for stability
-            arch_embedding = model.encode_architecture_simple(network)
+            # Use GHN2-based architecture encoder if available
+            if hasattr(model, 'encode_architecture_ghn2'):
+                arch_embedding = model.encode_architecture_ghn2(network)
+                #print('Used GHN2 Embedding',arch_embedding)
+            else:
+                arch_embedding = model.encode_architecture_simple(network)
 
             # Save original adaptation parameters for later restoration
             adaptation_params = {}
@@ -216,8 +216,9 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
             # Inner loop adaptation - simulate fine-tuning
             adaptation_steps = 8 if args.k_shot == 1 else 3
 
-            # Get task embedding
-            task_embedding = model.encode_task(task_support_images, task_support_labels)
+            # Get task embedding with mixed precision
+            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                task_embedding = model.encode_task(task_support_images, task_support_labels)
 
             temperature = 1.0
             if args.k_shot == 1:
@@ -226,42 +227,74 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
             inner_lr_initial = 0.005  # Lower starting LR
             inner_lr_factor = 0.85  # Decay factor
 
-            # Inner loop optimization (simplified)
+            # Inner loop optimization with mixed precision
             for ad_step in range(adaptation_steps):
                 inner_lr = inner_lr_initial * (inner_lr_factor ** ad_step)
+
                 # Forward pass on support set
-                support_logits = model(task_support_images, arch_embedding, task_embedding, temperature)
-                inner_loss = F.cross_entropy(support_logits, task_support_labels)
+                with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                    support_logits = model(task_support_images, arch_embedding, task_embedding, temperature)
+                    inner_loss = F.cross_entropy(support_logits, task_support_labels)
 
-                inner_loss.backward(retain_graph=True)
+                # Backward pass
+                if scaler.is_enabled():
+                    scaler.scale(inner_loss).backward(retain_graph=True)
+                    scaler.unscale_(optimizer)  # Unscale gradients for clipping
+                else:
+                    inner_loss.backward(retain_graph=True)
 
-                # Manually update adaptation layers
+                # Manually update adaptation layers with gradient clipping
                 with torch.no_grad():
                     for name, param in model.named_parameters():
                         if ('adapt_layer' in name or 'classifier' in name) and param.grad is not None:
+                            # Apply parameter normalization based on type
+                            if 'weight' in name and 'conv' in name:
+                                param_type = 'conv_weight'
+                            elif 'weight' in name and ('bn' in name or 'layer_norm' in name):
+                                param_type = 'bn_weight'
+                            elif 'bias' in name:
+                                param_type = 'bias'
+                            elif 'weight' in name:
+                                param_type = 'fc_weight'
+                            else:
+                                param_type = 'other'
+
+                            # Clip gradient
                             grad_norm = param.grad.norm()
                             if grad_norm > 2.0:
                                 param.grad = param.grad * (2.0 / grad_norm)
+
+                            # Update parameter
                             param.data = param.data - inner_lr * param.grad
+
+                            # Apply normalization
+                            if hasattr(model, 'normalize_parameters'):
+                                param.data = model.normalize_parameters(param.data, param_type)
+
+                            # Clear gradient
                             param.grad = None
 
-            # Evaluate on query set after adaptation
-            query_logits = model(task_query_images, arch_embedding, task_embedding, temperature)
-            outer_loss = F.cross_entropy(query_logits, task_query_labels)
-            if args.k_shot == 1:
-                query_features = model.extract_multi_scale_features(task_query_images)[0]
-                support_features = model.extract_multi_scale_features(task_support_images)[0]
+            # Evaluate on query set after adaptation with mixed precision
+            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                query_logits = model(task_query_images, arch_embedding, task_embedding, temperature)
+                outer_loss = F.cross_entropy(query_logits, task_query_labels)
 
-                query_features = F.normalize(query_features, dim=1)
-                support_features = F.normalize(support_features, dim=1)
+                # Add domain alignment loss for 1-shot tasks
+                if args.k_shot == 1 and hasattr(model, 'extract_multi_scale_features'):
+                    query_features = model.extract_multi_scale_features(task_query_images)[0]
+                    support_features = model.extract_multi_scale_features(task_support_images)[0]
 
-                domain_loss = F.mse_loss(
-                    query_features.mean(0),
-                    support_features.mean(0)
-                ) * 0.1  # Scale factor
+                    query_features = F.normalize(query_features, dim=1)
+                    support_features = F.normalize(support_features, dim=1)
 
-                # Add to outer loss
-                outer_loss = outer_loss + domain_loss
+                    domain_loss = F.mse_loss(
+                        query_features.mean(0),
+                        support_features.mean(0)
+                    ) * 0.1  # Scale factor
+
+                    # Add to outer loss
+                    outer_loss = outer_loss + domain_loss
+
             batch_losses.append(outer_loss)
 
             # Calculate accuracy
@@ -277,8 +310,18 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
         # Average loss across tasks
         loss = torch.mean(torch.stack(batch_losses))
 
-        # Apply gradient stabilization
-        success, grad_norms = train_with_gradient_stabilization(model, optimizer, loss, args)
+        # Apply gradient updates with mixed precision and stabilization
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            success = train_with_gradient_stabilization(model, optimizer, None, args)
+            if success:
+                scaler.step(optimizer)
+                scaler.update()
+        else:
+            loss.backward()
+            success = train_with_gradient_stabilization(model, optimizer, None, args)
+            if success:
+                optimizer.step()
 
         if success:
             train_losses.append(loss.item())
@@ -289,124 +332,14 @@ def meta_training(model, train_dataset, train_sampler, networks, optimizer,sched
                 'loss': f"{loss.item():.4f}",
                 'acc': f"{np.mean(batch_accs):.4f}"
             })
-            if scheduler is not None:
-                scheduler.step()
-
-    return np.mean(train_losses), np.mean(train_accs)
-"""
-
-def meta_training(model, train_dataset, train_sampler, networks, optimizer, scheduler,scaler, device, args):
-    """Enhanced training with functional meta-learning approach"""
-    model.train()
-    train_losses = []
-    train_accs = []
-
-    train_iter = tqdm(range(args.steps_per_epoch), desc="Training")
-    for step in train_iter:
-        # Sample tasks
-        tasks = train_sampler.sample_batch(args.meta_batch_size)
-        support_images, support_labels, query_images, query_labels = collate_task_batch(tasks, train_dataset)
-
-        # Move data to device
-        support_images = support_images.to(device)
-        support_labels = support_labels.to(device)
-        query_images = query_images.to(device)
-        query_labels = query_labels.to(device)
-
-        # Initialize loss and optimizer
-        optimizer.zero_grad()
-        batch_losses = []
-        batch_accs = []
-
-        for i in range(args.meta_batch_size):
-            # Get task-specific data
-            start_idx = i * args.n_way * args.k_shot
-            end_idx = (i + 1) * args.n_way * args.k_shot
-            task_support_images = support_images[start_idx:end_idx]
-            task_support_labels = support_labels[start_idx:end_idx]
-
-            start_idx = i * args.n_way * args.query_size
-            end_idx = (i + 1) * args.n_way * args.query_size
-            task_query_images = query_images[start_idx:end_idx]
-            task_query_labels = query_labels[start_idx:end_idx]
-
-            # Apply augmentation for 1-shot learning
-            if args.k_shot == 1:
-                task_support_images, task_support_labels = augment_support_set(
-                    task_support_images, task_support_labels, args.n_way, args.k_shot
-                )
-
-            # Sample network and get embeddings
-            network_idx = np.random.randint(len(networks))
-            network = networks[network_idx].to(device)
-            arch_embedding = model.encode_architecture_simple(network)
-            task_embedding = model.encode_task(task_support_images, task_support_labels)
-            with torch.amp.autocast(args.device):
-                # Forward pass directly on query set (without inner loop)
-                query_logits = model(task_query_images, arch_embedding, task_embedding,
-                                     temperature=0.8 if args.k_shot == 1 else 1.0)
-
-            # Compute loss
-            outer_loss = F.cross_entropy(query_logits, task_query_labels)
-
-            # Add domain confusion loss for 1-shot
-            if args.k_shot == 1:
-                query_features = model.extract_multi_scale_features(task_query_images)[0]
-                support_features = model.extract_multi_scale_features(task_support_images)[0]
-
-                # Use detach() to prevent backprop through these features
-                query_features = F.normalize(query_features, dim=1)
-                support_features = F.normalize(support_features, dim=1)
-
-                domain_loss = F.mse_loss(
-                    query_features.mean(0),
-                    support_features.mean(0)
-                ) * 0.1
-
-                outer_loss = outer_loss + domain_loss
-
-            batch_losses.append(outer_loss)
-
-            # Calculate accuracy
-            acc = compute_accuracy(query_logits, task_query_labels)
-            batch_accs.append(acc)
-
-        # Average loss across tasks
-        loss = torch.mean(torch.stack(batch_losses))
-
-        # Apply gradient stabilization
-        success, grad_norms = train_with_gradient_stabilization(model, optimizer, loss, scaler, args)
-
-        if success:
-            train_losses.append(loss.item())
-            train_accs.append(np.mean(batch_accs))
-
-            # Update progress bar
-            train_iter.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'acc': f"{np.mean(batch_accs):.4f}"
-            })
 
             if scheduler is not None:
                 scheduler.step()
 
-    torch.cuda.empty_cache()
     return np.mean(train_losses), np.mean(train_accs)
 
-def evaluate_arch_aware(model, val_dataset, val_sampler, device, args):
-    """
-    Evaluate architecture-aware model.
 
-    Args:
-        model: TaskAwareGHN model
-        val_dataset: Validation dataset
-        val_sampler: Task sampler
-        device: Device to use
-        args: Evaluation arguments
-
-    Returns:
-        Tuple of (average loss, average accuracy)
-    """
+def evaluate_arch_aware(model, val_dataset, val_sampler, networks, device, args):
     model.eval()
     val_losses = []
     val_accs = []
@@ -428,27 +361,40 @@ def evaluate_arch_aware(model, val_dataset, val_sampler, device, args):
             batch_accs = []
 
             for i in range(args.meta_batch_size):
-                # Get task-specific data
-                start_idx = i * args.n_way * args.k_shot
-                end_idx = (i + 1) * args.n_way * args.k_shot
-                task_support_images = support_images[start_idx:end_idx]
-                task_support_labels = support_labels[start_idx:end_idx]
+                # Get task-specific data using get_task_slice function
+                task_support_images = get_task_slice(support_images, i, args.n_way, args.k_shot)
+                task_support_labels = get_task_slice(support_labels, i, args.n_way, args.k_shot)
+                task_query_images = get_task_slice(query_images, i, args.n_way, args.query_size)
+                task_query_labels = get_task_slice(query_labels, i, args.n_way, args.query_size)
 
-                start_idx = i * args.n_way * args.query_size
-                end_idx = (i + 1) * args.n_way * args.query_size
-                task_query_images = query_images[start_idx:end_idx]
-                task_query_labels = query_labels[start_idx:end_idx]
+                # Sample a random network architecture
+                network_idx = np.random.randint(len(networks))
+                network = networks[network_idx].to(device)
 
-                # Encode architecture
-                arch_embedding = model.encode_architecture_simple(model.backbone)
+                # Try to use GHN2 encoding if available, otherwise fallback to simple encoding
+                if hasattr(model, 'ghn2') and model.ghn2 is not None:
+                    try:
+                        arch_embedding = model.encode_architecture_ghn2(network)
+                    except Exception as e:
+                        print(f"Warning: GHN2 encoding failed: {e}. Falling back to simple encoding.")
+                        arch_embedding = model.encode_architecture_simple(network)
+                else:
+                    arch_embedding = model.encode_architecture_simple(network)
+
+                # Get task embedding
+                task_embedding = model.encode_task(task_support_images, task_support_labels)
+
+                # Apply temperature scaling for 1-shot tasks
+                temperature = 0.8 if args.k_shot == 1 else 1.0
+
+                # Forward pass directly on query images
+                query_logits = model(task_query_images, arch_embedding, task_embedding, temperature)
 
                 # Compute loss and accuracy
-                _, loss, acc = compute_meta_loss(
-                    model, task_support_images, task_support_labels,
-                    task_query_images, task_query_labels, arch_embedding
-                )
+                loss = F.cross_entropy(query_logits, task_query_labels)
+                acc = compute_accuracy(query_logits, task_query_labels)
 
-                batch_losses.append(loss)
+                batch_losses.append(loss.item())
                 batch_accs.append(acc)
 
             val_loss_step = np.mean(batch_losses)
@@ -495,175 +441,35 @@ def create_network_family():
 
     return networks
 
-def evaluate_cross_domain(model, test_dataset, test_sampler, networks, device, args):
-    """
-    Evaluate cross-domain generalization.
-    """
-    model.eval()
-    results = {}
-
-    for net_idx, network in enumerate(networks):
-        net_name = type(network).__name__
-        test_losses = []
-        test_accs = []
-
-        with torch.no_grad():
-            test_iter = tqdm(range(args.test_steps), desc=f"Testing with {net_name}")
-            for step in test_iter:
-                # Sample tasks
-                tasks = test_sampler.sample_batch(args.meta_batch_size)
-                support_images, support_labels, query_images, query_labels = collate_task_batch(tasks, test_dataset)
-
-                # Move data to device
-                support_images = support_images.to(device)
-                support_labels = support_labels.to(device)
-                query_images = query_images.to(device)
-                query_labels = query_labels.to(device)
-
-                batch_losses = []
-                batch_accs = []
-
-                for i in range(args.meta_batch_size):
-                    # Get task-specific data
-                    start_idx = i * args.n_way * args.k_shot
-                    end_idx = (i + 1) * args.n_way * args.k_shot
-                    task_support_images = support_images[start_idx:end_idx]
-                    task_support_labels = support_labels[start_idx:end_idx]
-
-                    start_idx = i * args.n_way * args.query_size
-                    end_idx = (i + 1) * args.n_way * args.query_size
-                    task_query_images = query_images[start_idx:end_idx]
-                    task_query_labels = query_labels[start_idx:end_idx]
-
-                    # Use the simple architecture encoder for stability
-                    network = network.to(device)
-                    arch_embedding = model.encode_architecture_simple(network)
-
-                    # Set the current architecture as the backbone temporarily
-                    original_backbone = model.backbone
-                    model.backbone = network
-
-                    # Encode task from support set
-                    task_embedding = model.encode_task(task_support_images, task_support_labels)
-
-                    # Restore original backbone
-                    model.backbone = original_backbone
-
-                    # Get predictions on query set
-                    query_logits = model(task_query_images, arch_embedding, task_embedding)
-                    loss = F.cross_entropy(query_logits, task_query_labels)
-
-                    # Calculate accuracy
-                    acc = compute_accuracy(query_logits, task_query_labels)
-
-                    batch_losses.append(loss.item())
-                    batch_accs.append(acc)
-
-                test_loss_step = np.mean(batch_losses)
-                test_acc_step = np.mean(batch_accs)
-                test_losses.append(test_loss_step)
-                test_accs.append(test_acc_step)
-
-                # Update tqdm progress bar
-                test_iter.set_postfix({
-                    'loss': f"{test_loss_step:.4f}",
-                    'acc': f"{test_acc_step:.4f}"
-                })
-        results[net_name] = {
-            'loss': np.mean(test_losses),
-            'accuracy': np.mean(test_accs)
-        }
-        print(
-            f"Results with {net_name}: Loss = {results[net_name]['loss']:.4f}, Accuracy = {results[net_name]['accuracy']:.4f}")
-    return results
-
-
-def train_with_gradient_stabilization(model, optimizer, loss, scaler, args):
-    # For mixed precision, use safer approach
-    optimizer.zero_grad()
-
-    # Check if loss is valid before backward
-    if torch.isnan(loss) or torch.isinf(loss):
-        print("Warning: Loss is NaN or Inf, skipping batch")
-        return False, {}
-
-    # Use stable scaling for mixed precision
-    try:
-        scaler.scale(loss).backward()
-
-        # Check for NaN/Inf gradients before optimizer step
-        valid_gradients = True
-        for name, param in model.parameters():
-            if param.grad is not None:
-                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                    valid_gradients = False
-                    print(f"Warning: NaN or Inf gradients in {name}")
-                    break
-
-        if valid_gradients:
-            # Apply gradient clipping with lower threshold
-            scaler.unscale_(optimizer)
-            clip_value = args.grad_clip * 0.5  # More aggressive clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
-
-            # Update with scaler
-            scaler.step(optimizer)
-            scaler.update()
-            return True, {}
-        else:
-            # Skip update but still update scaler
-            scaler.update()
-            return False, {}
-
-    except RuntimeError as e:
-        print(f"Error in backward/optimization: {str(e)}")
-        scaler.update()  # Still update scaler
-        return False, {}
-
-def adjust_network_for_cifar(network):
-    """Adapt ImageNet pretrained networks for CIFAR-100 images (32x32)"""
-    # Replace first convolutional layer with smaller kernel for ResNets
-    if hasattr(network, 'conv1'):
-        in_channels = network.conv1.in_channels
-        out_channels = network.conv1.out_channels
-        network.conv1 = nn.Conv2d(in_channels, out_channels,
-                                  kernel_size=3, stride=1,
-                                  padding=1, bias=False)
-
-    # Remove maxpool which reduces spatial dimensions too much for CIFAR images
-    if hasattr(network, 'maxpool'):
-        network.maxpool = nn.Identity()
-
-    # For DenseNet
-    if hasattr(network, 'features') and isinstance(network.features[0], nn.Conv2d):
-        # Replace first conv
-        in_channels = network.features[0].in_channels
-        out_channels = network.features[0].out_channels
-        network.features[0] = nn.Conv2d(in_channels, out_channels,
-                                        kernel_size=3, stride=1,
-                                        padding=1, bias=False)
-        # Remove pooling if it exists
-        for i, module in enumerate(network.features):
-            if isinstance(module, nn.MaxPool2d):
-                network.features[i] = nn.Identity()
+def train_with_gradient_stabilization(model, optimizer, loss, args):
+    """Apply gradient stabilization without stepping optimizer."""
+    # Check for NaN gradients
+    valid_gradients = True
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                valid_gradients = False
+                print(f"Warning: NaN or Inf gradients in {name}")
                 break
 
-    # For MobileNetV2
-    if hasattr(network, 'features'):
-        # MobileNetV2 has a different structure - need to handle it separately
-        # Find the first Conv2d layer in the features
-        for i, module in enumerate(network.features):
-            if hasattr(module, 'conv') and hasattr(module.conv, 'stride'):
-                # For InvertedResidual blocks
-                module.conv.stride = (1, 1)
-                break
-            elif isinstance(module, nn.Conv2d) and module.stride == (2, 2):
-                # Direct Conv2d
-                network.features[i].stride = (1, 1)
-                break
+    if valid_gradients:
+        # Apply separate gradient clipping for different components
+        torch.nn.utils.clip_grad_norm_(
+            [p for n, p in model.named_parameters() if 'task_encoder' in n],
+            args.grad_clip
+        )
+        torch.nn.utils.clip_grad_norm_(
+            [p for n, p in model.named_parameters() if 'adapt_layer' in n],
+            args.grad_clip * 0.5  # More aggressive clipping for adaptation modules
+        )
+        torch.nn.utils.clip_grad_norm_(
+            [p for n, p in model.named_parameters() if 'param_generator' in n],
+            args.grad_clip * 0.7  # Moderate clipping for parameter generator
+        )
 
-    return network
-
+        return True
+    else:
+        return False
 
 def setup_progressive_training(model, epoch, total_epochs, k_shot):
     """Configure model for progressive training with 1-shot specific handling."""
@@ -693,6 +499,11 @@ def setup_progressive_training(model, epoch, total_epochs, k_shot):
 
     return phase
 
+def get_task_slice(tensor, task_idx, n_way, examples_per_class):
+    """Get task-specific slice from batched tensor."""
+    start_idx = task_idx * n_way * examples_per_class
+    end_idx = (task_idx + 1) * n_way * examples_per_class
+    return tensor[start_idx:end_idx]
 
 def main():
     """Main training function for architecture-aware GHN."""
@@ -773,6 +584,13 @@ def main():
 
     # Create save directory if it doesn't exist
     os.makedirs(args.save, exist_ok=True)
+    pretrained_ghn2_state_dict = torch.load('./checkpoints/ghn2_cifar100.pt', map_location='cpu')
+    # Create GHN2 instance if it's just a state dict
+    if isinstance(pretrained_ghn2_state_dict, dict) and 'state_dict' in pretrained_ghn2_state_dict:
+        ghn2 = GHN(**pretrained_ghn2_state_dict['config'])
+        ghn2.load_state_dict(pretrained_ghn2_state_dict['state_dict'])
+        ghn2.eval()
+        pretrained_ghn2 = ghn2
 
     # Initialize wandb if enabled
     if args.use_wandb:
@@ -828,15 +646,14 @@ def main():
         hidden_dim=args.hidden_dim,
         num_classes=args.n_way,
         device=device,
-        ve_cutoff=args.ve_cutoff
+        ve_cutoff=args.ve_cutoff,
+        ghn2=pretrained_ghn2
     ).to(device)
+
+    model = initialize_from_ghn2(model, pretrained_ghn2)
 
     model.backbone = robust_network_adaptation(model.backbone)
 
-    # Pre-cache architecture embeddings for all networks
-    for network in [model.backbone] + networks:
-        with torch.no_grad():
-            _ = model.encode_architecture_simple(network)
 
     # Create optimizer
     optimizer = torch.optim.AdamW(
@@ -873,12 +690,12 @@ def main():
         print(f"\nEpoch {epoch + 1}/{args.epochs} - Phase {phase} - LR: {scheduler.get_last_lr()[0]:.6f}")
 
         # Training with architecture variety
-        train_loss, train_acc = meta_training(model, train_dataset, train_sampler, networks, optimizer,scheduler,scaler, device, args)
+        train_loss, train_acc = meta_training(model, train_dataset, train_sampler, networks, optimizer, scheduler, device, args)
         print(f"Training - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
 
         # Validation
         val_loss, val_acc = evaluate_arch_aware(
-            model, val_dataset, val_sampler, device, args
+            model, val_dataset, val_sampler, networks, device, args
         )
         print(f"Validation - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
 
@@ -941,4 +758,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
     main()
