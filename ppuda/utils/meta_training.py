@@ -1,7 +1,10 @@
 import argparse
+import math
 
 import torch
+from torch import nn
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import LambdaLR
 import wandb
 from tqdm.auto import tqdm
 
@@ -18,8 +21,8 @@ def parse_args():
                         help='K-shot learning (default: 1)')
     parser.add_argument('--n-query', type=int, default=15,
                         help='Number of query examples per class (default: 15)')
-    parser.add_argument('--n-episodes', type=int, default=600,
-                        help='Number of episodes per dataset (default: 600)')
+    parser.add_argument('--n-episodes', type=int, default=500,
+                        help='Number of episodes per dataset (default: 500)')
 
     # Model arguments
     parser.add_argument('--backbone', type=str, default='resnet34',
@@ -30,13 +33,13 @@ def parse_args():
     parser.add_argument('--adaptation-dim', type=int, default=64,
                         help='Task adaptation dimension (default: 64)')
     parser.add_argument('--ghn-checkpoint', type=str,
-                        default='./checkpoints/ghn2_cifar100.pt',
+                        default='./checkpoints/ghn2_imagenet.pt',
                         help='Path to GHN2 checkpoint')
 
     # Training arguments
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs (default: 100)')
-    parser.add_argument('--lr', type=float, default=0.001,
+    parser.add_argument('--lr', type=float, default=5e-5,
                         help='Learning rate (default: 0.001)')
     parser.add_argument('--batch-size', type=int, default=4,
                         help='Meta-batch size (default: 4)')
@@ -73,6 +76,11 @@ def parse_args():
 
     return args
 
+def lr_lambda(epoch):
+    if epoch < 10:
+        return epoch / 10
+    else:
+        return 0.5 * (1 + math.cos(math.pi * (epoch - 10) / (epoch - 10)))
 
 def train_adaptive_model(model, meta_train_loader, meta_val_loader,
                          learning_rate=0.001, epochs=50, device="cuda",
@@ -84,18 +92,19 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
     for param in model.base_encoder.parameters():
         param.requires_grad = False
 
-    # Set adaptation layers to training mode
-    for param in model.adaptation_module.parameters():
-        param.requires_grad = True
-
     # Optimization setup
-    optimizer = torch.optim.Adam(model.adaptation_module.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    optimizer = torch.optim.Adam(
+        model.adaptation_module.parameters(),
+        lr=learning_rate,  # Lower learning rate
+        weight_decay=1e-4  # Add weight decay
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     best_acc = 0
     best_epoch = 0
-
+    eval_frequency = 5
+    patience = 15
+    patience_counter = 0
     for epoch in tqdm(range(epochs), desc="Epochs"):
-        print(f"\nEpoch {epoch + 1}/{epochs}")
         model.train()
         train_loss = 0
         train_acc = 0
@@ -133,6 +142,13 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
                 correct += (pred == query_labs).sum().item()
                 total += query_labs.size(0)
 
+            for name, param in model.adaptation_module.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm()
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        print(f"NaN or Inf gradient detected in {name}!")
+                        param.grad.zero_()
+
             # Backprop and update
             meta_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -142,29 +158,22 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
             train_loss += meta_loss.item()
             train_acc += correct / total
             tasks_processed += 1
-            train_pbar.set_postfix({
-                'loss': f"{meta_loss.item():.4f}",
-                'acc': f"{correct / total:.4f}"
-            })
+            train_pbar.set_postfix_str(
+                f"loss: {meta_loss.item():.4f} | acc: {correct / total:.2%} | lr: {scheduler.get_last_lr()[0]:.6f}"
+            )
         avg_train_loss = train_loss / tasks_processed
         avg_train_acc = train_acc / tasks_processed
-
-        # Validation
+            # Validation
         model.eval()
         val_acc = evaluate(model, meta_val_loader, device)
         scheduler.step()
         print(f"Epoch {epoch + 1}/{epochs}: "
-              f"Train Loss={avg_train_loss:.4f}, "
-              f"Train Acc={avg_train_acc:.4f}, "
-              f"Val Acc={val_acc:.4f}")
+                  f"Train Loss={avg_train_loss:.4f}, "
+                  f"Train Acc={avg_train_acc:.4f}, "
+                  f"Val Acc={val_acc:.4f}")
 
-        # Save best model
-        if val_acc > best_acc:
-            best_acc = val_acc
-            best_epoch = epoch
-            torch.save(model.state_dict(), 'best_adaptive_model.pth')
-
-        # Log metrics
+            # Save best model
+            # Log metrics
         if wandb_logging:
             wandb.log({
                 "train/loss": avg_train_loss,
@@ -173,6 +182,17 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
                 "lr": scheduler.get_last_lr()[0],
                 "epoch": epoch
             })
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_epoch = epoch
+            patience_counter = 0
+            torch.save(model.state_dict(), './experiments/best_taskaware_model.pth')
+        else:
+            patience_counter +=1
+            if patience_counter >= patience:
+                print(f"Early stopping after {epoch + 1} epochs")
+                break
 
         print(f"Epoch {epoch}: Train Loss {avg_train_loss:.4f}, "
               f"Train Acc {avg_train_acc:.4f}, Val Acc {val_acc:.4f}")
@@ -189,6 +209,9 @@ def evaluate(model, data_loader, device="cuda"):
     model.eval()
     correct = 0
     total = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.train()
 
     with torch.no_grad():
         progress_bar = tqdm(data_loader, desc="Evaluating")

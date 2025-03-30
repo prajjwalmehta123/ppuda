@@ -30,6 +30,11 @@ class TaskAdaptationModule(nn.Module):
             'layer3': nn.Linear(adaptation_dim, 256),
             'layer4': nn.Linear(adaptation_dim, 512),
         })
+        for layer_name in ['layer1', 'layer2', 'layer3', 'layer4']:
+            nn.init.xavier_normal_(self.gamma_layers[layer_name].weight, gain=0.01)
+            nn.init.constant_(self.gamma_layers[layer_name].bias, 0.0)
+            nn.init.xavier_normal_(self.beta_layers[layer_name].weight, gain=0.01)
+            nn.init.constant_(self.beta_layers[layer_name].bias, 0.0)
 
     def forward(self, task_prototype):
         # Encode the task/dataset
@@ -38,7 +43,7 @@ class TaskAdaptationModule(nn.Module):
         # Generate modulation parameters for each layer
         modulation_params = {}
         for layer_name in ['layer1', 'layer2', 'layer3', 'layer4']:
-            gamma = torch.sigmoid(self.gamma_layers[layer_name](task_embedding))
+            gamma = 1 + torch.tanh(self.gamma_layers[layer_name](task_embedding))
             beta = self.beta_layers[layer_name](task_embedding)
             modulation_params[layer_name] = (gamma, beta)
 
@@ -124,18 +129,41 @@ class TaskAdaptiveEncoder(nn.Module):
 
         return task_prototype
 
-    def forward(self, support_images, support_labels, query_images, n_way):
+    def forward(self, support_images, support_labels, query_images, n_way, temperature=1.0):
+        #print(f"Support images stats: min={support_images.min().item():.4f}, max={support_images.max().item():.4f}")
+        #print(f"Query images stats: min={query_images.min().item():.4f}, max={query_images.max().item():.4f}")
         # Compute task embedding from support set
         task_prototype = self.compute_task_embedding(support_images, support_labels, n_way)
+
+        # Check for NaNs in task prototype
+        if torch.isnan(task_prototype).any():
+            print("NaN detected in task prototype!")
+            task_prototype = torch.nan_to_num(task_prototype, nan=0.0)
 
         # Generate adaptation parameters
         modulation_params = self.adaptation_module(task_prototype)
 
-        # Extract support features with adaptation
-        support_features = self.extract_features_with_adaptation(
-            support_images, modulation_params)
+        # Extract features with adaptation
+        support_features = self.extract_features_with_adaptation(support_images, modulation_params)
+        query_features = self.extract_features_with_adaptation(query_images, modulation_params)
 
-        # Compute prototypes for each class
+        # Check for NaNs in features
+        if torch.isnan(support_features).any() or torch.isnan(query_features).any():
+            print("NaN detected in features!")
+            support_features = torch.nan_to_num(support_features, nan=0.0)
+            query_features = torch.nan_to_num(query_features, nan=0.0)
+
+        # Safe normalization
+        support_norms = torch.norm(support_features, p=2, dim=1, keepdim=True)
+        query_norms = torch.norm(query_features, p=2, dim=1, keepdim=True)
+
+        support_norms = torch.clamp(support_norms, min=1e-6)  # Prevent division by zero
+        query_norms = torch.clamp(query_norms, min=1e-6)
+
+        support_features = support_features / support_norms
+        query_features = query_features / query_norms
+
+        # Compute prototypes
         prototypes = []
         for c in range(n_way):
             class_mask = (support_labels == c)
@@ -146,18 +174,26 @@ class TaskAdaptiveEncoder(nn.Module):
                 prototypes.append(torch.zeros_like(support_features[0]))
         prototypes = torch.stack(prototypes)
 
-        # Extract query features with the same adaptation
-        query_features = self.extract_features_with_adaptation(
-            query_images, modulation_params)
+        # Normalize prototypes
+        prototype_norms = torch.norm(prototypes, p=2, dim=1, keepdim=True)
+        prototype_norms = torch.clamp(prototype_norms, min=1e-6)
+        prototypes = prototypes / prototype_norms
 
-        # L2 normalize features
-        support_features = F.normalize(support_features, p=2, dim=1)
-        query_features = F.normalize(query_features, p=2, dim=1)
-        prototypes = F.normalize(prototypes, p=2, dim=1)
+        # Compute similarities with stability checks
+        similarities = torch.mm(query_features, prototypes.t())
 
-        # Compute distances and logits
-        distances = torch.cdist(query_features, prototypes)
-        logits = -distances
+        # Check for NaNs in similarities
+        if torch.isnan(similarities).any():
+            print("NaN detected in similarities!")
+            similarities = torch.nan_to_num(similarities, nan=0.0)
+
+        # Use lower temperature for more stable gradients
+        logits = similarities * temperature
+
+        # Final NaN check
+        if torch.isnan(logits).any():
+            print("NaN detected in final logits!")
+            logits = torch.ones_like(logits) / n_way
 
         return logits
 
@@ -171,7 +207,9 @@ if __name__ == '__main__':
         ghn_checkpoint_path="/Users/prajjwalmehta/Desktop/projects/ppuda/checkpoints/ghn2_cifar100.pt",
         device='cpu',
     )
+    print("Checking for problematic parameters in base encoder...")
 
+    """
     adaptation_module = TaskAdaptationModule(feature_dim=512, adaptation_dim=64)
     model = TaskAdaptiveEncoder(base_encoder, adaptation_module)
 
@@ -184,3 +222,4 @@ if __name__ == '__main__':
     # Test forward pass
     logits = model(support_images, support_labels, query_images, n_way)
     print(f"Logits shape: {logits.shape}")
+    """

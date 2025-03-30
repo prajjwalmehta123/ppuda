@@ -73,7 +73,13 @@ def main(args):
         ghn_checkpoint_path=args.ghn_checkpoint,
         device=args.device
     )
-
+    for name, param in base_encoder.named_parameters():
+        if torch.isnan(param).any():
+            print(f"NaN found in parameter: {name}")
+        if torch.isinf(param).any():
+            print(f"Inf found in parameter: {name}")
+        if param.abs().max() > 1e3:
+            print(f"Extreme value in {name}: {param.abs().max().item()}")
     # Create adaptation module and full model
     adaptation_module = TaskAdaptationModule(
         feature_dim=args.feature_dim,
