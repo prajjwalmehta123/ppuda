@@ -3,7 +3,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 import wandb
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 
 def parse_args():
@@ -34,14 +34,14 @@ def parse_args():
                         help='Path to GHN2 checkpoint')
 
     # Training arguments
-    parser.add_argument('--epochs', type=int, default=50,
-                        help='Number of training epochs (default: 50)')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of training epochs (default: 100)')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate (default: 0.001)')
     parser.add_argument('--batch-size', type=int, default=4,
                         help='Meta-batch size (default: 4)')
-    parser.add_argument('--eval-episodes', type=int, default=50,
-                        help='Number of episodes for evaluation (default: 50)')
+    parser.add_argument('--eval-episodes', type=int, default=100,
+                        help='Number of episodes for evaluation (default: 100)')
 
     # System arguments
     parser.add_argument('--seed', type=int, default=42,
@@ -95,12 +95,14 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
     best_epoch = 0
 
     for epoch in tqdm(range(epochs), desc="Epochs"):
+        print(f"\nEpoch {epoch + 1}/{epochs}")
         model.train()
         train_loss = 0
         train_acc = 0
         tasks_processed = 0
+        train_pbar = tqdm(meta_train_loader, desc="Training", leave=False)
 
-        for task_batch, dataset_indices in meta_train_loader:
+        for task_batch, dataset_indices in train_pbar:
             batch_size = len(dataset_indices)
             all_logits = []
             all_query_labs = []
@@ -140,6 +142,10 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
             train_loss += meta_loss.item()
             train_acc += correct / total
             tasks_processed += 1
+            train_pbar.set_postfix({
+                'loss': f"{meta_loss.item():.4f}",
+                'acc': f"{correct / total:.4f}"
+            })
         avg_train_loss = train_loss / tasks_processed
         avg_train_acc = train_acc / tasks_processed
 
@@ -147,6 +153,10 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
         model.eval()
         val_acc = evaluate(model, meta_val_loader, device)
         scheduler.step()
+        print(f"Epoch {epoch + 1}/{epochs}: "
+              f"Train Loss={avg_train_loss:.4f}, "
+              f"Train Acc={avg_train_acc:.4f}, "
+              f"Val Acc={val_acc:.4f}")
 
         # Save best model
         if val_acc > best_acc:
@@ -181,20 +191,31 @@ def evaluate(model, data_loader, device="cuda"):
     total = 0
 
     with torch.no_grad():
-        for support_imgs, support_labs, query_imgs, query_labs in data_loader:
+        progress_bar = tqdm(data_loader, desc="Evaluating")
+        for batch in progress_bar:
+            # Check if the batch is from CombinedMetaDataset or regular MetaDataset
+            if isinstance(batch, list) and len(batch) == 2:
+                task_batch, _ = batch  # Unpack and ignore dataset indices
+
+            else:
+                support_imgs, support_labs, query_imgs, query_labs = batch
+
             # Move data to device
-            support_imgs = support_imgs.to(device)
-            support_labs = support_labs.to(device)
-            query_imgs = query_imgs.to(device)
-            query_labs = query_labs.to(device)
+            for i in range(len(task_batch[0])):
+                support_imgs = task_batch[0][i].to(device)
+                support_labs = task_batch[1][i].to(device)
+                query_imgs = task_batch[2][i].to(device)
+                query_labs = task_batch[3][i].to(device)
 
-            # Forward pass
-            logits = model(support_imgs, support_labs, query_imgs, n_way=support_labs.max().item() + 1)
+                # Forward pass
+                logits = model(support_imgs, support_labs, query_imgs,
+                               n_way=support_labs.max().item() + 1)
 
-            # Calculate accuracy
-            pred = logits.argmax(dim=1)
-            correct += (pred == query_labs).sum().item()
-            total += query_labs.size(0)
+                # Calculate accuracy
+                pred = logits.argmax(dim=1)
+                correct += (pred == query_labs).sum().item()
+                total += query_labs.size(0)
+            progress_bar.set_postfix({'acc': f"{correct / total:.4f}"})
 
     return correct / total
 

@@ -104,12 +104,13 @@ def main(args):
     torch.save(model.state_dict(), model_path)
 
     # Evaluate on each dataset separately
-    evaluate_cross_dataset(model, args)
+    #evaluate_cross_dataset(model, args)
     if not args.no_wandb:
         wandb.finish()
 
 
-def evaluate_cross_dataset(model, device):
+def evaluate_cross_dataset(model, args):
+    device = args.device
     # Create test loaders for each dataset
     datasets = ['cifar100', 'cifar10', 'svhn', 'omniglot']
     test_loaders = {}
