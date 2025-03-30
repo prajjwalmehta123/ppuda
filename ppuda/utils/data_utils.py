@@ -2,10 +2,16 @@ import torch
 import random
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-from torchvision.datasets import ImageFolder, CIFAR100, CIFAR10, SVHN,Omniglot
+from torchvision.datasets import ImageFolder, CIFAR100, CIFAR10, SVHN, Omniglot
+from PIL import Image
+import numpy as np
 
-
-
+def to_pil_safe(img):
+    """Convert to PIL Image if not already a PIL Image"""
+    if isinstance(img, Image.Image):
+        return img
+    else:
+        return transforms.ToPILImage()(img)
 
 class MetaDataset(Dataset):
     def __init__(self, dataset, n_way=5, k_shot=1, n_query=15, n_episodes=1000, transform=None):
@@ -16,15 +22,22 @@ class MetaDataset(Dataset):
         self.n_episodes = n_episodes
         self.transform = transform
         self.is_svhn = isinstance(dataset, SVHN)
+        self.is_omniglot = isinstance(dataset, Omniglot)
 
         # Group data by class
         self.data_by_class = {}
         for i in range(len(dataset)):
             if self.is_svhn:
-                img = dataset.data[i]
+                img = dataset.data[i].transpose(1, 2, 0)  # Convert to HWC format
                 label = dataset.labels[i]
+            elif self.is_omniglot:
+                img, label = dataset[i]
+                # Convert PIL Image to numpy array
+                if isinstance(img, Image.Image):
+                    img = np.array(img)
             else:
                 img, label = dataset[i]
+
             if label not in self.data_by_class:
                 self.data_by_class[label] = []
             self.data_by_class[label].append((img, i))
@@ -40,6 +53,7 @@ class MetaDataset(Dataset):
 
     def __len__(self):
         return self.n_episodes
+
     def __getitem__(self, idx):
         # Randomly sample n_way classes
         selected_classes = random.sample(self.valid_classes, self.n_way)
@@ -58,7 +72,7 @@ class MetaDataset(Dataset):
 
             # Support set
             for i in range(self.k_shot):
-                img,orig_idx = selected_samples[i]
+                img, orig_idx = selected_samples[i]
 
                 if self.transform:
                     img = self.transform(img)
@@ -67,7 +81,7 @@ class MetaDataset(Dataset):
 
             # Query set
             for i in range(self.k_shot, self.k_shot + self.n_query):
-                img,orig_idx = selected_samples[i]
+                img, orig_idx = selected_samples[i]
                 if self.transform:
                     img = self.transform(img)
                 query_images.append(img)
@@ -87,6 +101,7 @@ def get_transform(dataset_name):
     if dataset_name in ['cifar10', 'cifar100']:
         # CIFAR datasets are 32x32
         return transforms.Compose([
+            to_pil_safe,
             transforms.Resize((84, 84)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5071, 0.4867, 0.4408],
@@ -94,7 +109,7 @@ def get_transform(dataset_name):
         ])
     elif dataset_name == 'svhn':
         return transforms.Compose([
-            transforms.ToPILImage(),
+            to_pil_safe,
             transforms.Resize((84, 84)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.4377, 0.4438, 0.4728],
@@ -102,9 +117,13 @@ def get_transform(dataset_name):
         ])
     elif dataset_name == 'omniglot':
         return transforms.Compose([
+            to_pil_safe,
             transforms.Resize((84, 84)),
+            # Convert grayscale to RGB
+            transforms.Grayscale(num_output_channels=3),
             transforms.ToTensor(),
-            transforms.Normalize([0.92206], [0.08426])
+            transforms.Normalize(mean=[0.92206, 0.92206, 0.92206],
+                                 std=[0.08426, 0.08426, 0.08426])
         ])
     elif dataset_name == 'miniimagenet':
         return transforms.Compose([
@@ -122,7 +141,7 @@ def get_transform(dataset_name):
         ])
 
 
-def setup_meta_dataloaders(n_way=5, k_shot=1, n_query=15, target_datasets=None,n_episodes=600):
+def setup_meta_dataloaders(n_way=5, k_shot=1, n_query=15, target_datasets=None, n_episodes=600):
     if target_datasets is None:
         target_datasets = ['cifar10', 'svhn', 'omniglot']
     meta_train_datasets = []
@@ -137,8 +156,9 @@ def setup_meta_dataloaders(n_way=5, k_shot=1, n_query=15, target_datasets=None,n
     )
     meta_val_datasets.append(
         MetaDataset(cifar100_val, n_way, k_shot, n_query,
-                    n_episodes=n_episodes//5, transform=get_transform('cifar100'))
+                    n_episodes=n_episodes // 5, transform=get_transform('cifar100'))
     )
+
     if 'cifar10' in target_datasets:
         # CIFAR-10 (target dataset 1)
         cifar10_train = CIFAR10(root='./data', train=True, download=True)
@@ -149,8 +169,9 @@ def setup_meta_dataloaders(n_way=5, k_shot=1, n_query=15, target_datasets=None,n
         )
         meta_val_datasets.append(
             MetaDataset(cifar10_val, n_way, k_shot, n_query,
-                        n_episodes=n_episodes//5, transform=get_transform('cifar10'))
+                        n_episodes=n_episodes // 5, transform=get_transform('cifar10'))
         )
+
     if 'svhn' in target_datasets:
         # SVHN (target dataset 2)
         svhn_train = SVHN(root='./data', split='train', download=True)
@@ -161,7 +182,7 @@ def setup_meta_dataloaders(n_way=5, k_shot=1, n_query=15, target_datasets=None,n
         )
         meta_val_datasets.append(
             MetaDataset(svhn_test, n_way, k_shot, n_query,
-                        n_episodes=n_episodes//5, transform=get_transform('svhn'))
+                        n_episodes=n_episodes // 5, transform=get_transform('svhn'))
         )
 
     if 'omniglot' in target_datasets:
@@ -174,7 +195,7 @@ def setup_meta_dataloaders(n_way=5, k_shot=1, n_query=15, target_datasets=None,n
         )
         meta_val_datasets.append(
             MetaDataset(omniglot_val, n_way, k_shot, n_query,
-                        n_episodes=n_episodes//5, transform=get_transform('omniglot'))
+                        n_episodes=n_episodes // 5, transform=get_transform('omniglot'))
         )
 
     # Create data loaders

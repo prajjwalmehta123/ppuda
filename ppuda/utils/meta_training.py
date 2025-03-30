@@ -55,8 +55,8 @@ def parse_args():
                         help='Directory to save models (default: ./saved_models)')
 
     # Wandb arguments
-    parser.add_argument('--wandb-project', type=str, default='task-adaptive-ghn2',
-                        help='Wandb project name (default: task-adaptive-ghn2)')
+    parser.add_argument('--wandb-project', type=str, default='task-aware-ghn2',
+                        help='Wandb project name (default: task-aware-ghn2)')
     parser.add_argument('--wandb-entity', type=str, default=None,
                         help='Wandb entity name (default: None)')
     parser.add_argument('--wandb-name', type=str, default=None,
