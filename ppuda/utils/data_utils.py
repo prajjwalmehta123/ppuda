@@ -40,7 +40,6 @@ class MetaDataset(Dataset):
 
     def __len__(self):
         return self.n_episodes
-
     def __getitem__(self, idx):
         # Randomly sample n_way classes
         selected_classes = random.sample(self.valid_classes, self.n_way)

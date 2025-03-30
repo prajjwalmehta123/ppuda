@@ -2,6 +2,8 @@ import argparse
 
 import torch
 import torch.nn.functional as F
+import wandb
+from tqdm import tqdm
 
 
 def parse_args():
@@ -59,11 +61,6 @@ def parse_args():
     parser.add_argument('--no-wandb', action='store_true',
                         help='Disable wandb logging')
 
-    # Experiment mode
-    parser.add_argument('--mode', type=str, default='phased',
-                        choices=['phased', 'single'],
-                        help='Training mode: phased (incremental datasets) or single (all at once)')
-
     args = parser.parse_args()
 
     # Set CUDA availability
@@ -75,11 +72,6 @@ def parse_args():
         args.datasets = ['cifar100'] + args.datasets
 
     return args
-
-
-import torch
-import torch.nn.functional as F
-import wandb
 
 
 def train_adaptive_model(model, meta_train_loader, meta_val_loader,
@@ -102,48 +94,52 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
     best_acc = 0
     best_epoch = 0
 
-    for epoch in range(epochs):
-        # Training
+    for epoch in tqdm(range(epochs), desc="Epochs"):
         model.train()
         train_loss = 0
         train_acc = 0
         tasks_processed = 0
 
-        for task_batch in meta_train_loader:
+        for task_batch, dataset_indices in meta_train_loader:
+            batch_size = len(dataset_indices)
+            all_logits = []
+            all_query_labs = []
+            for i in range(batch_size):
+                support_imgs = task_batch[0][i].to(device)
+                support_labs = task_batch[1][i].to(device)
+                query_imgs = task_batch[2][i].to(device)
+                query_labs = task_batch[3][i].to(device)
+
+                logits = model(support_imgs, support_labs, query_imgs,
+                               n_way=support_labs.max().item() + 1)
+
+                all_logits.append(logits)
+                all_query_labs.append(query_labs)
+
+            optimizer.zero_grad()
             meta_loss = 0
             correct = 0
             total = 0
 
-            support_imgs, support_labs, query_imgs, query_labs = task_batch
-            support_imgs = support_imgs.to(device)
-            support_labs = support_labs.to(device)
-            query_imgs = query_imgs.to(device)
-            query_labs = query_labs.to(device)
+            for logits, query_labs in zip(all_logits, all_query_labs):
+                # Calculate loss
+                loss = F.cross_entropy(logits, query_labs)
+                meta_loss += loss / batch_size  # Average across tasks
 
-            # Forward pass
-            logits = model(support_imgs, support_labs, query_imgs, n_way=support_labs.max().item() + 1)
+                # Track accuracy
+                pred = logits.argmax(dim=1)
+                correct += (pred == query_labs).sum().item()
+                total += query_labs.size(0)
 
-            # Calculate loss
-            loss = F.cross_entropy(logits, query_labs)
-            meta_loss += loss
-
-            # Track accuracy
-            pred = logits.argmax(dim=1)
-            correct += (pred == query_labs).sum().item()
-            total += query_labs.size(0)
-
-            # Update weights
-            optimizer.zero_grad()
+            # Backprop and update
             meta_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
             optimizer.step()
 
             # Track metrics
             train_loss += meta_loss.item()
             train_acc += correct / total
             tasks_processed += 1
-
-        # Calculate average training metrics
         avg_train_loss = train_loss / tasks_processed
         avg_train_acc = train_acc / tasks_processed
 
