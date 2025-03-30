@@ -76,11 +76,14 @@ def parse_args():
 
     return args
 
-def lr_lambda(epoch):
-    if epoch < 10:
-        return epoch / 10
-    else:
-        return 0.5 * (1 + math.cos(math.pi * (epoch - 10) / (epoch - 10)))
+def get_lr_lambda(total_epochs):
+    def lr_lambda(epoch):
+        if epoch < 10:
+            return epoch / 10
+        else:
+            remaining_epochs = max(1, total_epochs - 10)
+            return 0.5 * (1 + math.cos(math.pi * (epoch - 10) / remaining_epochs))
+    return lr_lambda
 
 def train_adaptive_model(model, meta_train_loader, meta_val_loader,
                          learning_rate=0.001, epochs=50, device="cuda",
@@ -98,7 +101,7 @@ def train_adaptive_model(model, meta_train_loader, meta_val_loader,
         lr=learning_rate,  # Lower learning rate
         weight_decay=1e-4  # Add weight decay
     )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_lr_lambda(epochs))
     best_acc = 0
     best_epoch = 0
     eval_frequency = 5
