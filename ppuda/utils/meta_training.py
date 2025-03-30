@@ -98,7 +98,7 @@ def evaluate(model, data_loader, device="cuda"):
     with torch.no_grad():
         for batch_data in data_loader:
             # Unpack data
-            if isinstance(batch_data, tuple) and len(batch_data) == 2:
+            if isinstance(batch_data, list) and len(batch_data) == 2:
                 task_batch, _ = batch_data
             else:
                 task_batch = batch_data
